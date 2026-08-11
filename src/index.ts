@@ -110,6 +110,12 @@ export class Registry extends DurableObject<Env> {
       .map(rowToDraftSummary)[0];
   }
 
+  unregisterDraft(draftId: string): { removed: boolean } {
+    const existing = this.getDraft(draftId);
+    this.ctx.storage.sql.exec("DELETE FROM drafts WHERE draft_id = ?", draftId);
+    return { removed: Boolean(existing) };
+  }
+
   listDrafts(): DraftSummary[] {
     return this.ctx.storage.sql
       .exec<{
@@ -141,23 +147,38 @@ export class DraftWatcher extends DurableObject<Env> {
 
   async start(draftId: string, options: StartOptions = {}): Promise<WatcherStatus> {
     const current = await this.getStatus(draftId);
+    const sleeperPicks = await fetchSleeperPicks(draftId);
+    const picks = normalizeSleeperPicks(sleeperPicks);
+    const lastPickNumber = getLastPickNumber(picks);
     const pollIntervalSeconds = clampPollInterval(options.pollIntervalSeconds);
+    const now = new Date().toISOString();
+    const nextPollAt = new Date(Date.parse(now) + pollIntervalSeconds * 1000).toISOString();
     const status: WatcherStatus = {
       ...current,
       draftId,
       label: normalizeLabel(options.label) ?? current.label,
       isPolling: true,
       pollIntervalSeconds,
-      nextPollAt: new Date().toISOString(),
+      lastPollAt: now,
+      nextPollAt,
       lastError: null,
+      lastPickCount: picks.length,
+      lastKnownPickNumber: lastPickNumber,
+      lastEventAt:
+        picks.length !== current.lastPickCount || lastPickNumber !== current.lastKnownPickNumber
+          ? now
+          : current.lastEventAt,
+      picks,
     };
 
     await this.saveStatus(status);
-    await this.ctx.storage.setAlarm(Date.now());
+    await this.ctx.storage.setAlarm(Date.parse(nextPollAt));
     this.appendEvent("watcher.started", "Polling started", {
       draftId,
       pollIntervalSeconds,
       label: status.label,
+      pickCount: status.lastPickCount,
+      lastPickNumber: status.lastKnownPickNumber,
     });
     return status;
   }
@@ -196,6 +217,13 @@ export class DraftWatcher extends DurableObject<Env> {
         message: row.message,
         details: row.details ? JSON.parse(row.details) : null,
       }));
+  }
+
+  async remove(draftId: string): Promise<{ removed: boolean }> {
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.delete("status");
+    this.appendEvent("watcher.removed", "Watcher removed", { draftId });
+    return { removed: true };
   }
 
   async pollNow(draftId: string): Promise<WatcherStatus> {
@@ -348,9 +376,10 @@ export default {
       if (request.method === "POST" && route.action === "start") {
         const body = await readJson<StartOptions>(request);
         const label = normalizeLabel(body.label);
+        const status = await watcher.start(route.draftId, { ...body, label });
         const registry = env.REGISTRY.getByName("registry");
         await registry.registerDraft(route.draftId, label);
-        return json(await watcher.start(route.draftId, { ...body, label }));
+        return json(status);
       }
 
       if (request.method === "POST" && route.action === "stop") {
@@ -359,8 +388,17 @@ export default {
 
       if (request.method === "POST" && route.action === "poll") {
         const registry = env.REGISTRY.getByName("registry");
-        await registry.registerDraft(route.draftId, null);
-        return json(await watcher.pollNow(route.draftId));
+        const status = await watcher.pollNow(route.draftId);
+        if (!status.lastError) {
+          await registry.registerDraft(route.draftId, null);
+        }
+        return json(status, status.lastError ? 400 : 200);
+      }
+
+      if (request.method === "DELETE" && route.action === "remove") {
+        const registry = env.REGISTRY.getByName("registry");
+        await watcher.remove(route.draftId);
+        return json(await registry.unregisterDraft(route.draftId));
       }
 
       return json({ error: "Method not allowed" }, 405);
@@ -447,7 +485,7 @@ function getLastPickNumber(picks: DraftPick[]): number | null {
 }
 
 function matchDraftRoute(pathname: string): { draftId: string; action: string } | null {
-  const match = /^\/api\/drafts\/([^/]+)\/(status|events|start|stop|poll)$/.exec(pathname);
+  const match = /^\/api\/drafts\/([^/]+)\/(status|events|start|stop|poll|remove)$/.exec(pathname);
   if (!match) {
     return null;
   }
@@ -739,7 +777,13 @@ function renderDashboard(): string {
 
       async function api(path, options) {
         const res = await fetch(path, options);
-        if (!res.ok) throw new Error(await res.text());
+        if (!res.ok) {
+          let message = await res.text();
+          try {
+            message = JSON.parse(message).error || message;
+          } catch (_) {}
+          throw new Error(message);
+        }
         return res.json();
       }
 
@@ -799,7 +843,10 @@ function renderDashboard(): string {
           + '</dl>'
           + '<div class="status-line">'
           + '<button data-poll="' + esc(draft.draftId) + '" class="secondary">Poll</button>'
+          + '<span>'
+          + '<button data-remove="' + esc(draft.draftId) + '" class="secondary">Remove</button> '
           + '<button data-stop="' + esc(draft.draftId) + '" class="danger">Stop</button>'
+          + '</span>'
           + '</div>'
           + '<details><summary>Picks / players</summary>' + renderPicks(draft.picks) + '</details>'
           + '<details><summary>Recent events</summary><pre id="events-' + esc(draft.draftId) + '">Loading events...</pre></details>'
@@ -821,18 +868,26 @@ function renderDashboard(): string {
 
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
-        await api("/api/drafts/" + encodeURIComponent(draftId.value) + "/start", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ label: label.value, pollIntervalSeconds: Number(interval.value) }),
-        });
-        await load();
+        try {
+          await api("/api/drafts/" + encodeURIComponent(draftId.value) + "/start", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ label: label.value, pollIntervalSeconds: Number(interval.value) }),
+          });
+          await load();
+        } catch (error) {
+          alert(error instanceof Error ? error.message : "Start failed");
+        }
       });
 
       document.getElementById("poll-now").addEventListener("click", async () => {
         if (!draftId.value) return;
-        await api("/api/drafts/" + encodeURIComponent(draftId.value) + "/poll", { method: "POST" });
-        await load();
+        try {
+          await api("/api/drafts/" + encodeURIComponent(draftId.value) + "/poll", { method: "POST" });
+          await load();
+        } catch (error) {
+          alert(error instanceof Error ? error.message : "Poll failed");
+        }
       });
 
       document.getElementById("refresh").addEventListener("click", load);
@@ -844,6 +899,9 @@ function renderDashboard(): string {
         }
         if (target.dataset.stop) {
           await api("/api/drafts/" + encodeURIComponent(target.dataset.stop) + "/stop", { method: "POST" });
+        }
+        if (target.dataset.remove) {
+          await api("/api/drafts/" + encodeURIComponent(target.dataset.remove) + "/remove", { method: "DELETE" });
         }
         await load();
       });

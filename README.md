@@ -11,6 +11,7 @@ Generic Cloudflare Worker for watching Sleeper drafts and exposing a small publi
 - `POST /api/drafts/:draftId/start` - start polling
 - `POST /api/drafts/:draftId/stop` - stop polling
 - `POST /api/drafts/:draftId/poll` - force one poll
+- `DELETE /api/drafts/:draftId/remove` - remove a draft from the dashboard registry
 
 Start payload:
 
@@ -20,6 +21,8 @@ Start payload:
   "pollIntervalSeconds": 15
 }
 ```
+
+Drafts are registered for the dashboard only after Sleeper returns a successful picks response.
 
 ## Development
 
