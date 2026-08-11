@@ -18,6 +18,7 @@ type WatcherStatus = {
   lastPickCount: number;
   lastKnownPickNumber: number | null;
   lastEventAt: string | null;
+  picks: DraftPick[];
 };
 
 type WatcherEvent = {
@@ -26,6 +27,30 @@ type WatcherEvent = {
   type: string;
   message: string;
   details: unknown;
+};
+
+type DraftPick = {
+  pickNo: number | null;
+  round: number | null;
+  draftSlot: number | null;
+  playerId: string | null;
+  pickedBy: string | null;
+  rosterId: number | null;
+  firstName: string | null;
+  lastName: string | null;
+  fullName: string;
+  position: string | null;
+  team: string | null;
+};
+
+type SleeperPick = {
+  pick_no?: number;
+  round?: number;
+  draft_slot?: number;
+  player_id?: string;
+  picked_by?: string;
+  roster_id?: number;
+  metadata?: Record<string, unknown>;
 };
 
 type StartOptions = {
@@ -191,7 +216,8 @@ export class DraftWatcher extends DurableObject<Env> {
     const now = new Date();
 
     try {
-      const picks = await fetchSleeperPicks(draftId);
+      const sleeperPicks = await fetchSleeperPicks(draftId);
+      const picks = normalizeSleeperPicks(sleeperPicks);
       const lastPickNumber = getLastPickNumber(picks);
       const pickCount = picks.length;
       const changed =
@@ -209,6 +235,7 @@ export class DraftWatcher extends DurableObject<Env> {
         lastPickCount: pickCount,
         lastKnownPickNumber: lastPickNumber,
         lastEventAt: changed ? now.toISOString() : before.lastEventAt,
+        picks,
       };
 
       await this.saveStatus(status);
@@ -251,7 +278,7 @@ export class DraftWatcher extends DurableObject<Env> {
   private async getStatus(draftId: string): Promise<WatcherStatus> {
     const stored = await this.ctx.storage.get<WatcherStatus>("status");
     if (stored) {
-      return { ...stored, draftId };
+      return { ...stored, draftId, picks: stored.picks ?? [] };
     }
 
     return {
@@ -265,6 +292,7 @@ export class DraftWatcher extends DurableObject<Env> {
       lastPickCount: 0,
       lastKnownPickNumber: null,
       lastEventAt: null,
+      picks: [],
     };
   }
 
@@ -358,7 +386,7 @@ function rowToDraftSummary(row: {
   };
 }
 
-async function fetchSleeperPicks(draftId: string): Promise<Array<{ pick_no?: number }>> {
+async function fetchSleeperPicks(draftId: string): Promise<SleeperPick[]> {
   const response = await fetch(`${SLEEPER_API_BASE}/draft/${encodeURIComponent(draftId)}/picks`, {
     headers: { accept: "application/json" },
     signal: AbortSignal.timeout(10_000),
@@ -373,12 +401,47 @@ async function fetchSleeperPicks(draftId: string): Promise<Array<{ pick_no?: num
     throw new Error("Sleeper returned an unexpected picks payload");
   }
 
-  return body as Array<{ pick_no?: number }>;
+  return body as SleeperPick[];
 }
 
-function getLastPickNumber(picks: Array<{ pick_no?: number }>): number | null {
+function normalizeSleeperPicks(picks: SleeperPick[]): DraftPick[] {
+  return picks
+    .map((pick) => {
+      const firstName = stringFromMetadata(pick.metadata, "first_name");
+      const lastName = stringFromMetadata(pick.metadata, "last_name");
+      const position = stringFromMetadata(pick.metadata, "position");
+      const team = stringFromMetadata(pick.metadata, "team");
+      const fullName = [firstName, lastName].filter(Boolean).join(" ").trim();
+
+      return {
+        pickNo: numberOrNull(pick.pick_no),
+        round: numberOrNull(pick.round),
+        draftSlot: numberOrNull(pick.draft_slot),
+        playerId: typeof pick.player_id === "string" ? pick.player_id : null,
+        pickedBy: typeof pick.picked_by === "string" ? pick.picked_by : null,
+        rosterId: numberOrNull(pick.roster_id),
+        firstName,
+        lastName,
+        fullName: fullName || "Unknown player",
+        position,
+        team,
+      };
+    })
+    .sort((a, b) => (a.pickNo ?? Number.MAX_SAFE_INTEGER) - (b.pickNo ?? Number.MAX_SAFE_INTEGER));
+}
+
+function stringFromMetadata(metadata: Record<string, unknown> | undefined, key: string): string | null {
+  const value = metadata?.[key];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function numberOrNull(value: number | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function getLastPickNumber(picks: DraftPick[]): number | null {
   const pickNumbers = picks
-    .map((pick) => pick.pick_no)
+    .map((pick) => pick.pickNo)
     .filter((pickNo): pickNo is number => typeof pickNo === "number");
   return pickNumbers.length > 0 ? Math.max(...pickNumbers) : null;
 }
@@ -603,10 +666,43 @@ function renderDashboard(): string {
         border: 1px solid var(--border);
         font-size: 0.78rem;
       }
+      details {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        overflow: hidden;
+      }
+      summary {
+        cursor: pointer;
+        min-height: 40px;
+        padding: 10px 12px;
+        color: var(--accent-strong);
+        font-weight: 750;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.86rem;
+      }
+      th, td {
+        border-top: 1px solid var(--border);
+        padding: 8px 10px;
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        color: var(--muted);
+        font-size: 0.72rem;
+        text-transform: uppercase;
+      }
       @media (max-width: 780px) {
         header { align-items: flex-start; flex-direction: column; }
         .toolbar { grid-template-columns: 1fr; }
         .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        table, thead, tbody, tr, th, td { display: block; }
+        thead { display: none; }
+        td { border-top: 0; padding: 4px 10px; }
+        td:first-child { border-top: 1px solid var(--border); padding-top: 10px; font-weight: 750; }
+        td:last-child { padding-bottom: 10px; }
       }
     </style>
   </head>
@@ -652,6 +748,33 @@ function renderDashboard(): string {
         return new Date(value).toLocaleString();
       }
 
+      function esc(value) {
+        return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[char]);
+      }
+
+      function renderPicks(picks) {
+        if (!picks || picks.length === 0) {
+          return '<p style="padding: 0 12px 12px;">No picks recorded yet. Click Poll after entering a draft ID.</p>';
+        }
+
+        return '<table><thead><tr><th>Pick</th><th>Player</th><th>Pos</th><th>Team</th><th>Round</th><th>Slot</th></tr></thead><tbody>'
+          + picks.map((pick) => '<tr>'
+            + '<td>' + esc(pick.pickNo ?? "") + '</td>'
+            + '<td>' + esc(pick.fullName) + '</td>'
+            + '<td>' + esc(pick.position || "") + '</td>'
+            + '<td>' + esc(pick.team || "") + '</td>'
+            + '<td>' + esc(pick.round ?? "") + '</td>'
+            + '<td>' + esc(pick.draftSlot ?? "") + '</td>'
+          + '</tr>').join("")
+          + '</tbody></table>';
+      }
+
       function renderStatus(data) {
         const items = data.drafts || [];
         const active = items.filter((draft) => draft.isPolling).length;
@@ -664,21 +787,22 @@ function renderDashboard(): string {
         ].map(([k, v]) => '<div class="panel metric"><span>' + k + '</span><strong>' + v + '</strong></div>').join("");
 
         drafts.innerHTML = items.map((draft) => '<article class="panel draft">'
-          + '<div class="status-line"><h2>' + (draft.label || draft.draftId) + '</h2>'
+          + '<div class="status-line"><h2>' + esc(draft.label || draft.draftId) + '</h2>'
           + '<span class="badge ' + (draft.lastError ? 'err' : draft.isPolling ? 'ok' : '') + '">' + (draft.lastError ? 'error' : draft.isPolling ? 'polling' : 'stopped') + '</span></div>'
           + '<dl>'
-          + '<dt>Draft ID</dt><dd>' + draft.draftId + '</dd>'
-          + '<dt>Last poll</dt><dd>' + fmt(draft.lastPollAt) + '</dd>'
-          + '<dt>Next poll</dt><dd>' + fmt(draft.nextPollAt) + '</dd>'
-          + '<dt>Picks</dt><dd>' + draft.lastPickCount + '</dd>'
-          + '<dt>Last pick</dt><dd>' + (draft.lastKnownPickNumber || 'none') + '</dd>'
-          + '<dt>Error</dt><dd>' + (draft.lastError || 'none') + '</dd>'
+          + '<dt>Draft ID</dt><dd>' + esc(draft.draftId) + '</dd>'
+          + '<dt>Last poll</dt><dd>' + esc(fmt(draft.lastPollAt)) + '</dd>'
+          + '<dt>Next poll</dt><dd>' + esc(fmt(draft.nextPollAt)) + '</dd>'
+          + '<dt>Picks</dt><dd>' + esc(draft.lastPickCount) + '</dd>'
+          + '<dt>Last pick</dt><dd>' + esc(draft.lastKnownPickNumber || 'none') + '</dd>'
+          + '<dt>Error</dt><dd>' + esc(draft.lastError || 'none') + '</dd>'
           + '</dl>'
           + '<div class="status-line">'
-          + '<button data-poll="' + draft.draftId + '" class="secondary">Poll</button>'
-          + '<button data-stop="' + draft.draftId + '" class="danger">Stop</button>'
+          + '<button data-poll="' + esc(draft.draftId) + '" class="secondary">Poll</button>'
+          + '<button data-stop="' + esc(draft.draftId) + '" class="danger">Stop</button>'
           + '</div>'
-          + '<pre id="events-' + draft.draftId + '">Loading events...</pre>'
+          + '<details><summary>Picks / players</summary>' + renderPicks(draft.picks) + '</details>'
+          + '<details><summary>Recent events</summary><pre id="events-' + esc(draft.draftId) + '">Loading events...</pre></details>'
           + '</article>').join("") || '<p>No drafts registered yet.</p>';
 
         for (const draft of items) loadEvents(draft.draftId);
