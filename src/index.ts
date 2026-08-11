@@ -659,15 +659,14 @@ function buildManualHookPayload({
     }
 
     return {
-      eventId,
+      eventId: `manual-test:round:${completedRound.round}:${crypto.randomUUID()}`,
       eventType: "RoundCompleted",
       draftId,
       round: completedRound.round,
-      pickStart: completedRound.pickStart,
-      pickEnd: completedRound.pickEnd,
-      pickCount: completedRound.pickCount,
+      firstPickNumber: completedRound.pickStart,
+      lastPickNumber: completedRound.pickEnd,
+      completedAt: observedAt,
       sourceVersion: "manual-test-v1",
-      observedAt,
     };
   }
 

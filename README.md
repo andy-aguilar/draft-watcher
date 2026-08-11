@@ -99,6 +99,21 @@ Routes:
 - `POST /api/drafts/:draftId/test-hooks/chandler-pick`
 - `POST /api/drafts/:draftId/test-hooks/chandler-fallback`
 
+The round-summary test derives the latest completed Sleeper round and sends:
+
+```json
+{
+  "eventId": "manual-test:round:<round>:<uuid>",
+  "eventType": "RoundCompleted",
+  "draftId": "<draft_id>",
+  "round": 2,
+  "firstPickNumber": 13,
+  "lastPickNumber": 24,
+  "completedAt": "2026-08-11T18:55:00.000Z",
+  "sourceVersion": "manual-test-v1"
+}
+```
+
 Start payload:
 
 ```json
