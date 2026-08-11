@@ -29,6 +29,16 @@ type WatcherEvent = {
   details: unknown;
 };
 
+type HookAttempt = {
+  id: number;
+  eventId: string;
+  hook: string;
+  attemptedAt: string;
+  accepted: boolean;
+  status: number | null;
+  error: string | null;
+};
+
 type DraftPick = {
   pickNo: number | null;
   round: number | null;
@@ -192,6 +202,17 @@ export class DraftWatcher extends DurableObject<Env> {
           status INTEGER NOT NULL
         )
       `);
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS hook_attempts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id TEXT NOT NULL,
+          hook TEXT NOT NULL,
+          attempted_at TEXT NOT NULL,
+          accepted INTEGER NOT NULL,
+          status INTEGER,
+          error TEXT
+        )
+      `);
     });
   }
 
@@ -271,6 +292,34 @@ export class DraftWatcher extends DurableObject<Env> {
         type: row.type,
         message: row.message,
         details: row.details ? JSON.parse(row.details) : null,
+      }));
+  }
+
+  async hooks(limit = 50): Promise<HookAttempt[]> {
+    const boundedLimit = Math.max(1, Math.min(limit, 100));
+    return this.ctx.storage.sql
+      .exec<{
+        id: number;
+        event_id: string;
+        hook: string;
+        attempted_at: string;
+        accepted: number;
+        status: number | null;
+        error: string | null;
+      }>(
+        `SELECT id, event_id, hook, attempted_at, accepted, status, error
+         FROM hook_attempts ORDER BY id DESC LIMIT ?`,
+        boundedLimit,
+      )
+      .toArray()
+      .map((row) => ({
+        id: row.id,
+        eventId: row.event_id,
+        hook: row.hook,
+        attemptedAt: row.attempted_at,
+        accepted: row.accepted === 1,
+        status: row.status,
+        error: row.error,
       }));
   }
 
@@ -597,6 +646,7 @@ export class DraftWatcher extends DurableObject<Env> {
 
     try {
       const result = await triggerOpenClawHook(this.env as RuntimeEnv, hook, payload);
+      this.recordHookAttempt(eventId, hook, true, result.status, null);
       this.markHookDelivered(eventId, hook, result.status);
       this.appendEvent("webhook.delivered", "Webhook delivered", {
         eventId,
@@ -605,6 +655,13 @@ export class DraftWatcher extends DurableObject<Env> {
       });
       return true;
     } catch (error) {
+      this.recordHookAttempt(
+        eventId,
+        hook,
+        false,
+        null,
+        error instanceof Error ? error.message : "Unknown webhook error",
+      );
       this.appendEvent("webhook.error", "Webhook delivery failed", {
         eventId,
         hook,
@@ -630,6 +687,25 @@ export class DraftWatcher extends DurableObject<Env> {
       hook,
       new Date().toISOString(),
       status,
+    );
+  }
+
+  private recordHookAttempt(
+    eventId: string,
+    hook: string,
+    accepted: boolean,
+    status: number | null,
+    error: string | null,
+  ): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO hook_attempts (event_id, hook, attempted_at, accepted, status, error)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      eventId,
+      hook,
+      new Date().toISOString(),
+      accepted ? 1 : 0,
+      status,
+      error,
     );
   }
 
@@ -695,6 +771,11 @@ export default {
       if (request.method === "GET" && route.action === "events") {
         const limit = Number(url.searchParams.get("limit") ?? "50");
         return json({ events: await watcher.events(Number.isFinite(limit) ? limit : 50) });
+      }
+
+      if (request.method === "GET" && route.action === "hooks") {
+        const limit = Number(url.searchParams.get("limit") ?? "50");
+        return json({ hooks: await watcher.hooks(Number.isFinite(limit) ? limit : 50) });
       }
 
       if (request.method === "POST" && route.action === "start") {
@@ -1134,7 +1215,7 @@ function isManualHookName(value: string): value is ManualHookName {
 }
 
 function matchDraftRoute(pathname: string): { draftId: string; action: string } | null {
-  const match = /^\/api\/drafts\/([^/]+)\/(status|events|start|stop|poll|remove)$/.exec(pathname);
+  const match = /^\/api\/drafts\/([^/]+)\/(status|events|hooks|start|stop|poll|remove)$/.exec(pathname);
   if (!match) {
     return null;
   }
@@ -1288,6 +1369,12 @@ function renderDashboard(): string {
         gap: 10px;
         margin-bottom: 18px;
       }
+      .draft-meta {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+        margin-bottom: 18px;
+      }
       .summary {
         display: grid;
         grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1369,17 +1456,27 @@ function renderDashboard(): string {
         color: var(--accent-strong);
         font-weight: 750;
       }
-      .hook-tests {
+      .tabs {
         display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 8px;
-        padding: 0 12px 12px;
+        gap: 12px;
       }
-      .hook-result {
-        grid-column: 1 / -1;
-        min-height: 42px;
-        margin-top: 2px;
-        white-space: pre-wrap;
+      .tab-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .tab-button {
+        color: var(--text);
+        background: transparent;
+        border-color: var(--border);
+      }
+      .tab-button.active {
+        color: #fff;
+        background: var(--accent);
+        border-color: var(--accent);
+      }
+      .tab-panel[hidden] {
+        display: none;
       }
       table {
         width: 100%;
@@ -1399,9 +1496,9 @@ function renderDashboard(): string {
       }
       @media (max-width: 780px) {
         header { align-items: flex-start; flex-direction: column; }
+        .draft-meta { grid-template-columns: 1fr; }
         .toolbar { grid-template-columns: 1fr; }
         .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-        .hook-tests { grid-template-columns: 1fr; }
         table, thead, tbody, tr, th, td { display: block; }
         thead { display: none; }
         td { border-top: 0; padding: 4px 10px; }
@@ -1421,13 +1518,11 @@ function renderDashboard(): string {
       </header>
 
       <section class="panel">
-        <form class="toolbar" id="start-form">
-          <input id="draft-id" name="draftId" placeholder="Sleeper draft ID" autocomplete="off" required />
-          <input id="label" name="label" placeholder="Label" autocomplete="off" />
-          <input id="interval" name="interval" type="number" min="10" max="300" value="15" aria-label="Polling interval seconds" />
-          <button type="submit">Start</button>
-          <button type="button" class="secondary" id="poll-now">Poll</button>
-        </form>
+        <div class="draft-meta">
+          <div class="panel metric"><span>Draft ID</span><strong>1389377683300831233</strong></div>
+          <div class="panel metric"><span>Name</span><strong>Southerner's Cup Draft</strong></div>
+          <div class="panel metric"><span>Teams</span><strong>12</strong></div>
+        </div>
         <div class="summary" id="summary"></div>
         <div class="drafts" id="drafts"></div>
       </section>
@@ -1436,10 +1531,7 @@ function renderDashboard(): string {
     <script>
       const summary = document.getElementById("summary");
       const drafts = document.getElementById("drafts");
-      const form = document.getElementById("start-form");
-      const draftId = document.getElementById("draft-id");
-      const label = document.getElementById("label");
-      const interval = document.getElementById("interval");
+      const activeTabs = new Map();
 
       async function api(path, options) {
         const res = await fetch(path, options);
@@ -1470,7 +1562,7 @@ function renderDashboard(): string {
 
       function renderPicks(picks) {
         if (!picks || picks.length === 0) {
-          return '<p style="padding: 0 12px 12px;">No picks recorded yet. Click Poll after entering a draft ID.</p>';
+          return '<p>No picks recorded yet.</p>';
         }
 
         return '<table><thead><tr><th>Pick</th><th>Player</th><th>Pos</th><th>Team</th><th>Round</th><th>Slot</th></tr></thead><tbody>'
@@ -1485,6 +1577,16 @@ function renderDashboard(): string {
           + '</tbody></table>';
       }
 
+      function renderHooks(hooks) {
+        if (!hooks || hooks.length === 0) return "No hooks fired yet.";
+        return hooks.map((hook) => [
+          hook.attemptedAt + "  " + hook.hook + "  " + (hook.accepted ? "accepted" : "failed"),
+          "eventId: " + hook.eventId,
+          "status: " + (hook.status ?? "none"),
+          hook.error ? "error: " + hook.error : null,
+        ].filter(Boolean).join("\\n")).join("\\n\\n");
+      }
+
       function renderStatus(data) {
         const items = data.drafts || [];
         const active = items.filter((draft) => draft.isPolling).length;
@@ -1496,37 +1598,40 @@ function renderDashboard(): string {
           ["Last refresh", new Date().toLocaleTimeString()],
         ].map(([k, v]) => '<div class="panel metric"><span>' + k + '</span><strong>' + v + '</strong></div>').join("");
 
-        drafts.innerHTML = items.map((draft) => '<article class="panel draft">'
-          + '<div class="status-line"><h2>' + esc(draft.label || draft.draftId) + '</h2>'
-          + '<span class="badge ' + (draft.lastError ? 'err' : draft.isPolling ? 'ok' : '') + '">' + (draft.lastError ? 'error' : draft.isPolling ? 'polling' : 'stopped') + '</span></div>'
-          + '<dl>'
-          + '<dt>Draft ID</dt><dd>' + esc(draft.draftId) + '</dd>'
-          + '<dt>Last poll</dt><dd>' + esc(fmt(draft.lastPollAt)) + '</dd>'
-          + '<dt>Next poll</dt><dd>' + esc(fmt(draft.nextPollAt)) + '</dd>'
-          + '<dt>Picks</dt><dd>' + esc(draft.lastPickCount) + '</dd>'
-          + '<dt>Last pick</dt><dd>' + esc(draft.lastKnownPickNumber || 'none') + '</dd>'
-          + '<dt>Error</dt><dd>' + esc(draft.lastError || 'none') + '</dd>'
-          + '</dl>'
-          + '<div class="status-line">'
-          + '<button data-poll="' + esc(draft.draftId) + '" class="secondary">Poll</button>'
-          + '<span>'
-          + '<button data-remove="' + esc(draft.draftId) + '" class="secondary">Remove</button> '
-          + '<button data-stop="' + esc(draft.draftId) + '" class="danger">Stop</button>'
-          + '</span>'
-          + '</div>'
-          + '<details><summary>Picks / players</summary>' + renderPicks(draft.picks) + '</details>'
-          + '<details><summary>SCBot hook tests</summary>'
-          + '<div class="hook-tests">'
-          + '<button data-hook="draft-pick-announce" data-draft="' + esc(draft.draftId) + '">Test pick announcement</button>'
-          + '<button data-hook="round-summary" data-draft="' + esc(draft.draftId) + '">Test round summary</button>'
-          + '<button data-hook="chandler-pick" data-draft="' + esc(draft.draftId) + '">Test Chandler advice</button>'
-          + '<button data-hook="chandler-fallback" data-draft="' + esc(draft.draftId) + '">Test Chandler fallback</button>'
-          + '<pre class="hook-result" id="hook-result-' + esc(draft.draftId) + '">No hook test run yet.</pre>'
-          + '</div></details>'
-          + '<details><summary>Recent events</summary><pre id="events-' + esc(draft.draftId) + '">Loading events...</pre></details>'
-          + '</article>').join("") || '<p>No drafts registered yet.</p>';
+        drafts.innerHTML = items.map((draft) => {
+          const activeTab = activeTabs.get(draft.draftId) || "picks";
+          return '<article class="panel draft">'
+            + '<div class="status-line"><h2>Southerner\\'s Cup Draft</h2>'
+            + '<span class="badge ' + (draft.lastError ? 'err' : draft.isPolling ? 'ok' : '') + '">' + (draft.lastError ? 'error' : draft.isPolling ? 'polling' : 'stopped') + '</span></div>'
+            + '<dl>'
+            + '<dt>Last poll</dt><dd>' + esc(fmt(draft.lastPollAt)) + '</dd>'
+            + '<dt>Next poll</dt><dd>' + esc(fmt(draft.nextPollAt)) + '</dd>'
+            + '<dt>Picks</dt><dd>' + esc(draft.lastPickCount) + '</dd>'
+            + '<dt>Last pick</dt><dd>' + esc(draft.lastKnownPickNumber || 'none') + '</dd>'
+            + '<dt>Error</dt><dd>' + esc(draft.lastError || 'none') + '</dd>'
+            + '</dl>'
+            + '<div class="status-line"><button data-poll="' + esc(draft.draftId) + '" class="secondary">Poll now</button></div>'
+            + '<div class="tabs">'
+            + '<div class="tab-list" role="tablist">'
+            + tabButton(draft.draftId, "picks", "Picks / players", activeTab)
+            + tabButton(draft.draftId, "events", "Recent polling events", activeTab)
+            + tabButton(draft.draftId, "hooks", "Fired hooks", activeTab)
+            + '</div>'
+            + '<div class="tab-panel" ' + (activeTab === "picks" ? "" : "hidden") + '>' + renderPicks(draft.picks) + '</div>'
+            + '<pre class="tab-panel" id="events-' + esc(draft.draftId) + '" ' + (activeTab === "events" ? "" : "hidden") + '>Loading events...</pre>'
+            + '<pre class="tab-panel" id="hooks-' + esc(draft.draftId) + '" ' + (activeTab === "hooks" ? "" : "hidden") + '>Loading hooks...</pre>'
+            + '</div>'
+            + '</article>';
+        }).join("") || '<p>No drafts registered yet.</p>';
 
-        for (const draft of items) loadEvents(draft.draftId);
+        for (const draft of items) {
+          loadEvents(draft.draftId);
+          loadHooks(draft.draftId);
+        }
+      }
+
+      function tabButton(draftId, tab, labelText, activeTab) {
+        return '<button type="button" class="tab-button ' + (activeTab === tab ? 'active' : '') + '" data-tab="' + tab + '" data-draft="' + esc(draftId) + '">' + labelText + '</button>';
       }
 
       async function load() {
@@ -1540,68 +1645,24 @@ function renderDashboard(): string {
         el.textContent = data.events.map((event) => event.at + "  " + event.type + "  " + event.message).join("\\n") || "No events yet.";
       }
 
-      form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        try {
-          await api("/api/drafts/" + encodeURIComponent(draftId.value) + "/start", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ label: label.value, pollIntervalSeconds: Number(interval.value) }),
-          });
-          await load();
-        } catch (error) {
-          alert(error instanceof Error ? error.message : "Start failed");
-        }
-      });
-
-      document.getElementById("poll-now").addEventListener("click", async () => {
-        if (!draftId.value) return;
-        try {
-          await api("/api/drafts/" + encodeURIComponent(draftId.value) + "/poll", { method: "POST" });
-          await load();
-        } catch (error) {
-          alert(error instanceof Error ? error.message : "Poll failed");
-        }
-      });
+      async function loadHooks(id) {
+        const el = document.getElementById("hooks-" + id);
+        if (!el) return;
+        const data = await api("/api/drafts/" + encodeURIComponent(id) + "/hooks?limit=12");
+        el.textContent = renderHooks(data.hooks);
+      }
 
       document.getElementById("refresh").addEventListener("click", load);
       drafts.addEventListener("click", async (event) => {
         const target = event.target;
         if (!(target instanceof HTMLButtonElement)) return;
+        if (target.dataset.tab && target.dataset.draft) {
+          activeTabs.set(target.dataset.draft, target.dataset.tab);
+          await load();
+          return;
+        }
         if (target.dataset.poll) {
           await api("/api/drafts/" + encodeURIComponent(target.dataset.poll) + "/poll", { method: "POST" });
-        }
-        if (target.dataset.stop) {
-          await api("/api/drafts/" + encodeURIComponent(target.dataset.stop) + "/stop", { method: "POST" });
-        }
-        if (target.dataset.remove) {
-          await api("/api/drafts/" + encodeURIComponent(target.dataset.remove) + "/remove", { method: "DELETE" });
-        }
-        if (target.dataset.hook && target.dataset.draft) {
-          const result = document.getElementById("hook-result-" + target.dataset.draft);
-          target.disabled = true;
-          if (result) result.textContent = "Sending " + target.textContent + "...";
-          try {
-            const data = await api(
-              "/api/drafts/" + encodeURIComponent(target.dataset.draft) + "/test-hooks/" + encodeURIComponent(target.dataset.hook),
-              { method: "POST" },
-            );
-            if (result) {
-              result.textContent = [
-                "Accepted: " + data.hook,
-                "Status: " + data.status,
-                "Event ID: " + data.eventId,
-                data.message,
-              ].join("\\n");
-            }
-          } catch (error) {
-            if (result) {
-              result.textContent = error instanceof Error ? error.message : "Hook test failed";
-            }
-          } finally {
-            target.disabled = false;
-          }
-          return;
         }
         await load();
       });

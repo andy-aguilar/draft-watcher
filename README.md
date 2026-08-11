@@ -8,6 +8,7 @@ Generic Cloudflare Worker for watching Sleeper drafts and exposing a small publi
 - `GET /api/status` - all registered drafts
 - `GET /api/drafts/:draftId/status` - one draft
 - `GET /api/drafts/:draftId/events` - recent events
+- `GET /api/drafts/:draftId/hooks` - recent SCBot hook attempts
 - `POST /api/drafts/:draftId/start` - start polling
 - `POST /api/drafts/:draftId/stop` - stop polling
 - `POST /api/drafts/:draftId/poll` - force one poll
