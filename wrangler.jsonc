@@ -10,7 +10,8 @@
   },
   "vars": {
     "DRAFT_WATCHER_PUBLIC_BASE_URL": "https://draft-watcher.aaguil3.workers.dev",
-    "OPENCLAW_BASE_URL": "https://ai-ff-commissioner.fly.dev"
+    "OPENCLAW_BASE_URL": "https://ai-ff-commissioner.fly.dev",
+    "CHANDLER_ROSTER_ID": "7"
   },
   "durable_objects": {
     "bindings": [

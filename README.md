@@ -114,6 +114,43 @@ The round-summary test derives the latest completed Sleeper round and sends:
 }
 ```
 
+The Chandler advice test sends:
+
+```json
+{
+  "testMode": false,
+  "eventId": "manual-test:chandler-advice:<uuid>",
+  "eventType": "TurnStarted",
+  "draftId": "<draft_id>",
+  "pickSequence": "<current_pick_number>",
+  "rosterId": "7",
+  "clockStartedAt": "2026-08-11T19:30:00.000Z",
+  "deadline": "2026-08-12T15:30:00.000Z",
+  "sourceVersion": "manual-test-v1",
+  "strategyVersion": "synthetic-test-v1",
+  "strategySnapshot": "Synthetic test only. Prefer value, maintain positional balance, and plan two rounds ahead. Do not use Chandler private data."
+}
+```
+
+The Chandler fallback test sends:
+
+```json
+{
+  "testMode": false,
+  "eventId": "manual-test:chandler-fallback:<uuid>",
+  "eventType": "FallbackDue",
+  "draftId": "<draft_id>",
+  "pickSequence": "<current_pick_number>",
+  "rosterId": "7",
+  "clockStartedAt": "2026-08-11T19:30:00.000Z",
+  "deadline": "2026-08-12T15:30:00.000Z",
+  "thresholdReachedAt": "2026-08-12T15:30:00.000Z",
+  "sourceVersion": "manual-test-v1",
+  "strategyVersion": "synthetic-test-v1",
+  "strategySnapshot": "Synthetic test only. Prefer value, maintain positional balance, and do not use Chandler private data."
+}
+```
+
 Start payload:
 
 ```json

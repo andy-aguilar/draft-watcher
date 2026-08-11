@@ -672,23 +672,45 @@ function buildManualHookPayload({
 
   const currentTurn = currentDraftTurn(sleeperDraft, picks);
   const chandlerRosterId = parseOptionalInteger(env.CHANDLER_ROSTER_ID);
-  const isChandlerOnClock =
-    chandlerRosterId !== null &&
-    currentTurn.rosterId !== null &&
-    chandlerRosterId === currentTurn.rosterId;
+  const rosterId = chandlerRosterId ?? currentTurn.rosterId;
+  const clockStartedAt = observedAt;
+  const deadline = new Date(Date.parse(observedAt) + 20 * 60 * 60 * 1000).toISOString();
+
+  if (rosterId === null) {
+    throw new Error("Could not determine Chandler roster ID");
+  }
+
+  if (hook === "chandler-pick") {
+    return {
+      testMode: false,
+      eventId: `manual-test:chandler-advice:${crypto.randomUUID()}`,
+      eventType: "TurnStarted",
+      draftId,
+      pickSequence: String(currentTurn.pickNumber),
+      rosterId: String(rosterId),
+      clockStartedAt,
+      deadline,
+      sourceVersion: "manual-test-v1",
+      strategyVersion: "synthetic-test-v1",
+      strategySnapshot:
+        "Synthetic test only. Prefer value, maintain positional balance, and plan two rounds ahead. Do not use Chandler private data.",
+    };
+  }
 
   return {
-    eventId,
-    eventType: hook === "chandler-pick" ? "ChandlerPickAdvice" : "ChandlerFallback",
+    testMode: false,
+    eventId: `manual-test:chandler-fallback:${crypto.randomUUID()}`,
+    eventType: "FallbackDue",
     draftId,
-    currentPickNumber: currentTurn.pickNumber,
-    round: currentTurn.round,
-    draftSlot: currentTurn.draftSlot,
-    rosterId: currentTurn.rosterId,
-    isChandlerOnClock,
+    pickSequence: String(currentTurn.pickNumber),
+    rosterId: String(rosterId),
+    clockStartedAt,
+    deadline,
+    thresholdReachedAt: deadline,
     sourceVersion: "manual-test-v1",
-    observedAt,
-    ...(hook === "chandler-fallback" ? { testPrefix: "TEST - NOT A REAL PICK" } : {}),
+    strategyVersion: "synthetic-test-v1",
+    strategySnapshot:
+      "Synthetic test only. Prefer value, maintain positional balance, and do not use Chandler private data.",
   };
 }
 
@@ -859,9 +881,7 @@ function parseOptionalInteger(value: string | undefined): number | null {
 
 function manualHookMessage(hook: ManualHookName, payload: Record<string, unknown>): string {
   if (hook === "chandler-pick" || hook === "chandler-fallback") {
-    return payload.isChandlerOnClock
-      ? "Accepted. Chandler appears to own the current turn."
-      : "Accepted, but no Telegram message is expected unless Chandler owns the current turn.";
+    return `Accepted for roster ${payload.rosterId}. If there is no Telegram message, SCBot likely returned NO_REPLY because Chandler is not on the clock.`;
   }
 
   return "Accepted by OpenClaw.";
