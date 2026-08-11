@@ -53,6 +53,18 @@ type SleeperPick = {
   metadata?: Record<string, unknown>;
 };
 
+type SleeperDraft = {
+  draft_id?: string;
+  type?: string;
+  status?: string;
+  draft_order?: Record<string, number>;
+  slot_to_roster_id?: Record<string, number>;
+  settings?: {
+    teams?: number;
+    rounds?: number;
+  };
+};
+
 type StartOptions = {
   label?: string | null;
   pollIntervalSeconds?: number;
@@ -62,6 +74,9 @@ type RuntimeEnv = Env & {
   DRAFT_EVENT_WEBHOOK_URL?: string;
   DRAFT_EVENT_WEBHOOK_TOKEN?: string;
   DRAFT_WATCHER_PUBLIC_BASE_URL?: string;
+  OPENCLAW_BASE_URL?: string;
+  WEBHOOK_TOKEN?: string;
+  CHANDLER_ROSTER_ID?: string;
 };
 
 type DraftWebhookEvent = {
@@ -73,6 +88,12 @@ type DraftWebhookEvent = {
   statusUrl: string;
   pick: DraftPick;
 };
+
+type ManualHookName =
+  | "draft-pick-announce"
+  | "round-summary"
+  | "chandler-pick"
+  | "chandler-fallback";
 
 const DEFAULT_POLL_INTERVAL_SECONDS = 15;
 const MIN_POLL_INTERVAL_SECONDS = 10;
@@ -456,6 +477,14 @@ export default {
         return json({ service: "draft-watcher", drafts: statuses });
       }
 
+      const testHookRoute = matchTestHookRoute(url.pathname);
+      if (testHookRoute && request.method === "POST") {
+        if (!(env as RuntimeEnv).WEBHOOK_TOKEN) {
+          return json({ error: "WEBHOOK_TOKEN is not configured" }, 503);
+        }
+        return json(await triggerManualHookTest(env, testHookRoute.draftId, testHookRoute.hook));
+      }
+
       const route = matchDraftRoute(url.pathname);
       if (!route) {
         return json({ error: "Not found" }, 404);
@@ -541,6 +570,157 @@ async function fetchSleeperPicks(draftId: string): Promise<SleeperPick[]> {
   return body as SleeperPick[];
 }
 
+async function fetchSleeperDraft(draftId: string): Promise<SleeperDraft> {
+  const response = await fetch(`${SLEEPER_API_BASE}/draft/${encodeURIComponent(draftId)}`, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Sleeper draft returned ${response.status}`);
+  }
+
+  const body = await response.json();
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new Error("Sleeper returned an unexpected draft payload");
+  }
+
+  return body as SleeperDraft;
+}
+
+async function triggerManualHookTest(env: Env, draftId: string, hook: ManualHookName) {
+  const runtimeEnv = env as RuntimeEnv;
+  const [sleeperDraft, sleeperPicks] = await Promise.all([
+    fetchSleeperDraft(draftId),
+    fetchSleeperPicks(draftId),
+  ]);
+  const picks = normalizeSleeperPicks(sleeperPicks);
+  const observedAt = new Date().toISOString();
+  const eventId = `manual-test:${hook}:${crypto.randomUUID()}`;
+  const payload = buildManualHookPayload({
+    draftId,
+    eventId,
+    hook,
+    observedAt,
+    picks,
+    sleeperDraft,
+    env: runtimeEnv,
+  });
+  const result = await triggerOpenClawHook(runtimeEnv, hook, payload);
+
+  return {
+    accepted: true,
+    hook,
+    eventId: result.eventId,
+    status: result.status,
+    message: manualHookMessage(hook, payload),
+  };
+}
+
+function buildManualHookPayload({
+  draftId,
+  eventId,
+  hook,
+  observedAt,
+  picks,
+  sleeperDraft,
+  env,
+}: {
+  draftId: string;
+  eventId: string;
+  hook: ManualHookName;
+  observedAt: string;
+  picks: DraftPick[];
+  sleeperDraft: SleeperDraft;
+  env: RuntimeEnv;
+}): Record<string, unknown> {
+  if (hook === "draft-pick-announce") {
+    const pick = latestCompletedPick(picks);
+    if (!pick) {
+      throw new Error("No completed Sleeper pick has pickNumber, playerId, and rosterId");
+    }
+
+    return {
+      eventId,
+      eventType: "PickMade",
+      draftId,
+      pickNumber: pick.pickNo,
+      playerId: pick.playerId,
+      rosterId: pick.rosterId,
+      sourceVersion: "manual-test-v1",
+      observedAt,
+    };
+  }
+
+  if (hook === "round-summary") {
+    const completedRound = latestCompletedRound(sleeperDraft, picks);
+    if (!completedRound) {
+      throw new Error("No fully completed Sleeper round found");
+    }
+
+    return {
+      eventId,
+      eventType: "RoundCompleted",
+      draftId,
+      round: completedRound.round,
+      pickStart: completedRound.pickStart,
+      pickEnd: completedRound.pickEnd,
+      pickCount: completedRound.pickCount,
+      sourceVersion: "manual-test-v1",
+      observedAt,
+    };
+  }
+
+  const currentTurn = currentDraftTurn(sleeperDraft, picks);
+  const chandlerRosterId = parseOptionalInteger(env.CHANDLER_ROSTER_ID);
+  const isChandlerOnClock =
+    chandlerRosterId !== null &&
+    currentTurn.rosterId !== null &&
+    chandlerRosterId === currentTurn.rosterId;
+
+  return {
+    eventId,
+    eventType: hook === "chandler-pick" ? "ChandlerPickAdvice" : "ChandlerFallback",
+    draftId,
+    currentPickNumber: currentTurn.pickNumber,
+    round: currentTurn.round,
+    draftSlot: currentTurn.draftSlot,
+    rosterId: currentTurn.rosterId,
+    isChandlerOnClock,
+    sourceVersion: "manual-test-v1",
+    observedAt,
+    ...(hook === "chandler-fallback" ? { testPrefix: "TEST - NOT A REAL PICK" } : {}),
+  };
+}
+
+async function triggerOpenClawHook(
+  env: RuntimeEnv,
+  path: ManualHookName,
+  payload: Record<string, unknown>,
+): Promise<{ status: number; eventId: string }> {
+  const baseUrl = (env.OPENCLAW_BASE_URL ?? "https://ai-ff-commissioner.fly.dev").replace(/\/+$/, "");
+  const response = await fetch(`${baseUrl}/hooks/${path}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.WEBHOOK_TOKEN}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(15_000),
+  });
+
+  await response.text();
+
+  if (!response.ok) {
+    throw new Error(`OpenClaw rejected the webhook with HTTP ${response.status}`);
+  }
+
+  return {
+    status: response.status,
+    eventId: String(payload.eventId),
+  };
+}
+
 function normalizeSleeperPicks(picks: SleeperPick[]): DraftPick[] {
   return picks
     .map((pick) => {
@@ -581,6 +761,132 @@ function getLastPickNumber(picks: DraftPick[]): number | null {
     .map((pick) => pick.pickNo)
     .filter((pickNo): pickNo is number => typeof pickNo === "number");
   return pickNumbers.length > 0 ? Math.max(...pickNumbers) : null;
+}
+
+function latestCompletedPick(picks: DraftPick[]): DraftPick | null {
+  return [...picks]
+    .filter(
+      (pick) =>
+        typeof pick.pickNo === "number" &&
+        typeof pick.playerId === "string" &&
+        typeof pick.rosterId === "number",
+    )
+    .sort((a, b) => (b.pickNo ?? 0) - (a.pickNo ?? 0))[0] ?? null;
+}
+
+function latestCompletedRound(
+  draft: SleeperDraft,
+  picks: DraftPick[],
+): { round: number; pickStart: number; pickEnd: number; pickCount: number } | null {
+  const teams = draftTeamCount(draft, picks);
+  if (!teams) return null;
+
+  const rounds = new Map<number, DraftPick[]>();
+  for (const pick of picks) {
+    if (typeof pick.round !== "number") continue;
+    const existing = rounds.get(pick.round) ?? [];
+    existing.push(pick);
+    rounds.set(pick.round, existing);
+  }
+
+  return [...rounds.entries()]
+    .map(([round, roundPicks]) => {
+      const pickNumbers = roundPicks
+        .map((pick) => pick.pickNo)
+        .filter((pickNo): pickNo is number => typeof pickNo === "number");
+      const draftSlots = new Set(
+        roundPicks
+          .map((pick) => pick.draftSlot)
+          .filter((draftSlot): draftSlot is number => typeof draftSlot === "number"),
+      );
+
+      if (pickNumbers.length < teams || draftSlots.size < teams) return null;
+      return {
+        round,
+        pickStart: Math.min(...pickNumbers),
+        pickEnd: Math.max(...pickNumbers),
+        pickCount: roundPicks.length,
+      };
+    })
+    .filter((round): round is { round: number; pickStart: number; pickEnd: number; pickCount: number } => Boolean(round))
+    .sort((a, b) => b.round - a.round)[0] ?? null;
+}
+
+function currentDraftTurn(
+  draft: SleeperDraft,
+  picks: DraftPick[],
+): { pickNumber: number; round: number | null; draftSlot: number | null; rosterId: number | null } {
+  const teams = draftTeamCount(draft, picks);
+  const pickNumber = picks.length + 1;
+  if (!teams) {
+    return { pickNumber, round: null, draftSlot: null, rosterId: null };
+  }
+
+  const round = Math.floor((pickNumber - 1) / teams) + 1;
+  const indexInRound = (pickNumber - 1) % teams;
+  const isSnakeEvenRound = draft.type === "snake" && round % 2 === 0;
+  const draftSlot = isSnakeEvenRound ? teams - indexInRound : indexInRound + 1;
+  const rosterId = numberFromRecord(draft.slot_to_roster_id, String(draftSlot));
+  return { pickNumber, round, draftSlot, rosterId };
+}
+
+function draftTeamCount(draft: SleeperDraft, picks: DraftPick[]): number | null {
+  if (typeof draft.settings?.teams === "number" && draft.settings.teams > 0) {
+    return draft.settings.teams;
+  }
+
+  const draftOrderSize = draft.draft_order ? Object.keys(draft.draft_order).length : 0;
+  if (draftOrderSize > 0) return draftOrderSize;
+
+  const maxSlot = Math.max(
+    0,
+    ...picks
+      .map((pick) => pick.draftSlot)
+      .filter((draftSlot): draftSlot is number => typeof draftSlot === "number"),
+  );
+  return maxSlot > 0 ? maxSlot : null;
+}
+
+function numberFromRecord(record: Record<string, number> | undefined, key: string): number | null {
+  const value = record?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function parseOptionalInteger(value: string | undefined): number | null {
+  if (!value) return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : null;
+}
+
+function manualHookMessage(hook: ManualHookName, payload: Record<string, unknown>): string {
+  if (hook === "chandler-pick" || hook === "chandler-fallback") {
+    return payload.isChandlerOnClock
+      ? "Accepted. Chandler appears to own the current turn."
+      : "Accepted, but no Telegram message is expected unless Chandler owns the current turn.";
+  }
+
+  return "Accepted by OpenClaw.";
+}
+
+function matchTestHookRoute(pathname: string): { draftId: string; hook: ManualHookName } | null {
+  const match = /^\/api\/drafts\/([^/]+)\/test-hooks\/([^/]+)$/.exec(pathname);
+  if (!match || !isManualHookName(match[2])) {
+    return null;
+  }
+
+  return {
+    draftId: decodeURIComponent(match[1]),
+    hook: match[2],
+  };
+}
+
+function isManualHookName(value: string): value is ManualHookName {
+  return (
+    value === "draft-pick-announce" ||
+    value === "round-summary" ||
+    value === "chandler-pick" ||
+    value === "chandler-fallback"
+  );
 }
 
 function matchDraftRoute(pathname: string): { draftId: string; action: string } | null {
@@ -716,6 +1022,10 @@ function renderDashboard(): string {
         background: var(--danger);
         border-color: var(--danger);
       }
+      button:disabled {
+        cursor: wait;
+        opacity: 0.58;
+      }
       input {
         min-height: 40px;
         padding: 0 10px;
@@ -815,6 +1125,18 @@ function renderDashboard(): string {
         color: var(--accent-strong);
         font-weight: 750;
       }
+      .hook-tests {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        padding: 0 12px 12px;
+      }
+      .hook-result {
+        grid-column: 1 / -1;
+        min-height: 42px;
+        margin-top: 2px;
+        white-space: pre-wrap;
+      }
       table {
         width: 100%;
         border-collapse: collapse;
@@ -835,6 +1157,7 @@ function renderDashboard(): string {
         header { align-items: flex-start; flex-direction: column; }
         .toolbar { grid-template-columns: 1fr; }
         .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .hook-tests { grid-template-columns: 1fr; }
         table, thead, tbody, tr, th, td { display: block; }
         thead { display: none; }
         td { border-top: 0; padding: 4px 10px; }
@@ -948,6 +1271,14 @@ function renderDashboard(): string {
           + '</span>'
           + '</div>'
           + '<details><summary>Picks / players</summary>' + renderPicks(draft.picks) + '</details>'
+          + '<details><summary>SCBot hook tests</summary>'
+          + '<div class="hook-tests">'
+          + '<button data-hook="draft-pick-announce" data-draft="' + esc(draft.draftId) + '">Test pick announcement</button>'
+          + '<button data-hook="round-summary" data-draft="' + esc(draft.draftId) + '">Test round summary</button>'
+          + '<button data-hook="chandler-pick" data-draft="' + esc(draft.draftId) + '">Test Chandler advice</button>'
+          + '<button data-hook="chandler-fallback" data-draft="' + esc(draft.draftId) + '">Test Chandler fallback</button>'
+          + '<pre class="hook-result" id="hook-result-' + esc(draft.draftId) + '">No hook test run yet.</pre>'
+          + '</div></details>'
           + '<details><summary>Recent events</summary><pre id="events-' + esc(draft.draftId) + '">Loading events...</pre></details>'
           + '</article>').join("") || '<p>No drafts registered yet.</p>';
 
@@ -1001,6 +1332,32 @@ function renderDashboard(): string {
         }
         if (target.dataset.remove) {
           await api("/api/drafts/" + encodeURIComponent(target.dataset.remove) + "/remove", { method: "DELETE" });
+        }
+        if (target.dataset.hook && target.dataset.draft) {
+          const result = document.getElementById("hook-result-" + target.dataset.draft);
+          target.disabled = true;
+          if (result) result.textContent = "Sending " + target.textContent + "...";
+          try {
+            const data = await api(
+              "/api/drafts/" + encodeURIComponent(target.dataset.draft) + "/test-hooks/" + encodeURIComponent(target.dataset.hook),
+              { method: "POST" },
+            );
+            if (result) {
+              result.textContent = [
+                "Accepted: " + data.hook,
+                "Status: " + data.status,
+                "Event ID: " + data.eventId,
+                data.message,
+              ].join("\\n");
+            }
+          } catch (error) {
+            if (result) {
+              result.textContent = error instanceof Error ? error.message : "Hook test failed";
+            }
+          } finally {
+            target.disabled = false;
+          }
+          return;
         }
         await load();
       });

@@ -64,6 +64,41 @@ SCBot should treat `id` as the idempotency key and fetch `statusUrl` for
 canonical draft state instead of relying on the webhook payload as the full
 source of truth.
 
+## Manual SCBot Hook Tests
+
+The dashboard includes four server-side test buttons per registered draft:
+
+- Test pick announcement
+- Test round summary
+- Test Chandler advice
+- Test Chandler fallback
+
+The browser calls `draft-watcher`; `draft-watcher` calls OpenClaw server-side.
+The OpenClaw bearer token is never included in browser JavaScript, URLs, or
+responses.
+
+Configure the manual hook token:
+
+```bash
+npx wrangler secret put WEBHOOK_TOKEN
+```
+
+Optional non-secret config:
+
+```json
+{
+  "OPENCLAW_BASE_URL": "https://ai-ff-commissioner.fly.dev",
+  "CHANDLER_ROSTER_ID": "7"
+}
+```
+
+Routes:
+
+- `POST /api/drafts/:draftId/test-hooks/draft-pick-announce`
+- `POST /api/drafts/:draftId/test-hooks/round-summary`
+- `POST /api/drafts/:draftId/test-hooks/chandler-pick`
+- `POST /api/drafts/:draftId/test-hooks/chandler-fallback`
+
 Start payload:
 
 ```json

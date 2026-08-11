@@ -9,7 +9,8 @@
     "head_sampling_rate": 1
   },
   "vars": {
-    "DRAFT_WATCHER_PUBLIC_BASE_URL": "https://draft-watcher.aaguil3.workers.dev"
+    "DRAFT_WATCHER_PUBLIC_BASE_URL": "https://draft-watcher.aaguil3.workers.dev",
+    "OPENCLAW_BASE_URL": "https://ai-ff-commissioner.fly.dev"
   },
   "durable_objects": {
     "bindings": [
