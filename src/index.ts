@@ -1641,14 +1641,14 @@ function renderDashboard(): string {
       async function loadEvents(id) {
         const el = document.getElementById("events-" + id);
         if (!el) return;
-        const data = await api("/api/drafts/" + encodeURIComponent(id) + "/events?limit=8");
+        const data = await api("/api/drafts/" + encodeURIComponent(id) + "/events?limit=100");
         el.textContent = data.events.map((event) => event.at + "  " + event.type + "  " + event.message).join("\\n") || "No events yet.";
       }
 
       async function loadHooks(id) {
         const el = document.getElementById("hooks-" + id);
         if (!el) return;
-        const data = await api("/api/drafts/" + encodeURIComponent(id) + "/hooks?limit=12");
+        const data = await api("/api/drafts/" + encodeURIComponent(id) + "/hooks?limit=100");
         el.textContent = renderHooks(data.hooks);
       }
 
