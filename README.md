@@ -13,56 +13,57 @@ Generic Cloudflare Worker for watching Sleeper drafts and exposing a small publi
 - `POST /api/drafts/:draftId/poll` - force one poll
 - `DELETE /api/drafts/:draftId/remove` - remove a draft from the dashboard registry
 
-## Webhooks
+## SCBot Automation
 
-When a poll sees new picks, `draft-watcher` can POST one deterministic event per
-new pick to SCBot/OpenClaw.
+When polling sees new Sleeper picks, `draft-watcher` calls SCBot/OpenClaw
+server-side. The browser never receives the webhook token.
 
 Configure:
 
 ```bash
-npx wrangler secret put DRAFT_EVENT_WEBHOOK_URL
-npx wrangler secret put DRAFT_EVENT_WEBHOOK_TOKEN
+npx wrangler secret put WEBHOOK_TOKEN
 ```
 
-`DRAFT_EVENT_WEBHOOK_URL` should be the SCBot/OpenClaw inbound hook URL.
-`DRAFT_EVENT_WEBHOOK_TOKEN` is sent as `Authorization: Bearer <token>`.
-
-Payload:
+Non-secret config:
 
 ```json
 {
-  "id": "draft:<draft_id>:pick:<pick_no>",
-  "type": "PickMade",
-  "source": "draft-watcher",
-  "draftId": "<draft_id>",
-  "occurredAt": "2026-08-11T12:00:00.000Z",
-  "statusUrl": "https://draft-watcher.aaguil3.workers.dev/api/drafts/<draft_id>/status",
-  "pick": {
-    "pickNo": 1,
-    "round": 1,
-    "draftSlot": 1,
-    "playerId": "4046",
-    "pickedBy": "123",
-    "rosterId": 1,
-    "firstName": "Christian",
-    "lastName": "McCaffrey",
-    "fullName": "Christian McCaffrey",
-    "position": "RB",
-    "team": "SF"
-  }
+  "OPENCLAW_BASE_URL": "https://ai-ff-commissioner.fly.dev",
+  "CHANDLER_ROSTER_ID": "7"
 }
 ```
 
-Headers:
+Automatic hooks:
 
-- `Authorization: Bearer <DRAFT_EVENT_WEBHOOK_TOKEN>`
-- `X-Draft-Watcher-Event-Id: draft:<draft_id>:pick:<pick_no>`
-- `X-Draft-Watcher-Event-Type: PickMade`
+- New completed pick: `POST /hooks/draft-pick-announce`
+- Newly completed round: `POST /hooks/round-summary`
+- Chandler on the clock: `POST /hooks/chandler-pick`
+- Chandler fallback check due and pick still unmade: `POST /hooks/chandler-fallback`
 
-SCBot should treat `id` as the idempotency key and fetch `statusUrl` for
-canonical draft state instead of relying on the webhook payload as the full
-source of truth.
+Pick announcement payload:
+
+```json
+{
+  "eventId": "draft:<draft_id>:pick:<pick_no>",
+  "eventType": "PickMade",
+  "draftId": "<draft_id>",
+  "pickNumber": 24,
+  "playerId": "11604",
+  "rosterId": 8,
+  "sourceVersion": "draft-watcher-v1",
+  "observedAt": "2026-08-11T12:00:00.000Z"
+}
+```
+
+Round, Chandler advice, and Chandler fallback payloads use the same shapes as
+the manual test buttons below, with stable `draft:<...>` event IDs and
+`sourceVersion: draft-watcher-v1`. Successfully accepted event IDs are stored in
+the draft Durable Object so repeated polls do not double-post the same hook.
+
+The Chandler fallback timer uses East Africa Time, UTC+3. If Chandler comes on
+clock from noon through 17:59 EAT, the fallback check is scheduled six hours
+later; otherwise it waits until the next noon EAT. The fallback alarm re-checks
+Sleeper before calling SCBot and skips the hook if Chandler has already picked.
 
 ## Manual SCBot Hook Tests
 

@@ -71,22 +71,10 @@ type StartOptions = {
 };
 
 type RuntimeEnv = Env & {
-  DRAFT_EVENT_WEBHOOK_URL?: string;
-  DRAFT_EVENT_WEBHOOK_TOKEN?: string;
   DRAFT_WATCHER_PUBLIC_BASE_URL?: string;
   OPENCLAW_BASE_URL?: string;
   WEBHOOK_TOKEN?: string;
   CHANDLER_ROSTER_ID?: string;
-};
-
-type DraftWebhookEvent = {
-  id: string;
-  type: "PickMade";
-  source: "draft-watcher";
-  draftId: string;
-  occurredAt: string;
-  statusUrl: string;
-  pick: DraftPick;
 };
 
 type ManualHookName =
@@ -95,10 +83,27 @@ type ManualHookName =
   | "chandler-pick"
   | "chandler-fallback";
 
+type PendingChandlerFallback = {
+  draftId: string;
+  pickSequence: number;
+  rosterId: string;
+  clockStartedAt: string;
+  deadline: string;
+  thresholdReachedAt: string;
+  sourceVersion: string;
+  strategyVersion: string;
+  strategySnapshot: string;
+};
+
 const DEFAULT_POLL_INTERVAL_SECONDS = 15;
 const MIN_POLL_INTERVAL_SECONDS = 10;
 const MAX_POLL_INTERVAL_SECONDS = 300;
 const SLEEPER_API_BASE = "https://api.sleeper.app/v1";
+const CHANDLER_STRATEGY_VERSION = "synthetic-test-v1";
+const CHANDLER_ADVICE_STRATEGY =
+  "Synthetic test only. Prefer value, maintain positional balance, and plan two rounds ahead. Do not use Chandler private data.";
+const CHANDLER_FALLBACK_STRATEGY =
+  "Synthetic test only. Prefer value, maintain positional balance, and do not use Chandler private data.";
 
 export class Registry extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -179,12 +184,23 @@ export class DraftWatcher extends DurableObject<Env> {
           details TEXT
         )
       `);
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS delivered_hooks (
+          event_id TEXT PRIMARY KEY,
+          hook TEXT NOT NULL,
+          delivered_at TEXT NOT NULL,
+          status INTEGER NOT NULL
+        )
+      `);
     });
   }
 
   async start(draftId: string, options: StartOptions = {}): Promise<WatcherStatus> {
     const current = await this.getStatus(draftId);
-    const sleeperPicks = await fetchSleeperPicks(draftId);
+    const [sleeperDraft, sleeperPicks] = await Promise.all([
+      fetchSleeperDraft(draftId),
+      fetchSleeperPicks(draftId),
+    ]);
     const picks = normalizeSleeperPicks(sleeperPicks);
     const lastPickNumber = getLastPickNumber(picks);
     const pollIntervalSeconds = clampPollInterval(options.pollIntervalSeconds);
@@ -209,7 +225,7 @@ export class DraftWatcher extends DurableObject<Env> {
     };
 
     await this.saveStatus(status);
-    await this.ctx.storage.setAlarm(Date.parse(nextPollAt));
+    await this.scheduleNextAlarm(status);
     this.appendEvent("watcher.started", "Polling started", {
       draftId,
       pollIntervalSeconds,
@@ -217,6 +233,7 @@ export class DraftWatcher extends DurableObject<Env> {
       pickCount: status.lastPickCount,
       lastPickNumber: status.lastKnownPickNumber,
     });
+    await this.updateChandlerAutomation(draftId, sleeperDraft, status, now);
     return status;
   }
 
@@ -230,7 +247,8 @@ export class DraftWatcher extends DurableObject<Env> {
     };
 
     await this.saveStatus(stopped);
-    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.delete("pendingChandlerFallback");
+    await this.scheduleNextAlarm(stopped);
     this.appendEvent("watcher.stopped", "Polling stopped", { draftId });
     return stopped;
   }
@@ -259,6 +277,7 @@ export class DraftWatcher extends DurableObject<Env> {
   async remove(draftId: string): Promise<{ removed: boolean }> {
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.delete("status");
+    await this.ctx.storage.delete("pendingChandlerFallback");
     this.appendEvent("watcher.removed", "Watcher removed", { draftId });
     return { removed: true };
   }
@@ -270,10 +289,26 @@ export class DraftWatcher extends DurableObject<Env> {
   async alarm(): Promise<void> {
     const status = await this.ctx.storage.get<WatcherStatus>("status");
     if (!status?.isPolling) {
+      await this.ctx.storage.deleteAlarm();
       return;
     }
 
-    await this.poll(status.draftId, true);
+    const pendingFallback = await this.ctx.storage.get<PendingChandlerFallback>(
+      "pendingChandlerFallback",
+    );
+    const now = Date.now();
+
+    if (pendingFallback && Date.parse(pendingFallback.thresholdReachedAt) <= now) {
+      await this.checkChandlerFallback(pendingFallback);
+    }
+
+    const refreshed = await this.getStatus(status.draftId);
+    if (refreshed.isPolling && (!refreshed.nextPollAt || Date.parse(refreshed.nextPollAt) <= now)) {
+      await this.poll(refreshed.draftId, true);
+      return;
+    }
+
+    await this.scheduleNextAlarm(await this.getStatus(status.draftId));
   }
 
   private async poll(draftId: string, reschedule: boolean): Promise<WatcherStatus> {
@@ -281,7 +316,10 @@ export class DraftWatcher extends DurableObject<Env> {
     const now = new Date();
 
     try {
-      const sleeperPicks = await fetchSleeperPicks(draftId);
+      const [sleeperDraft, sleeperPicks] = await Promise.all([
+        fetchSleeperDraft(draftId),
+        fetchSleeperPicks(draftId),
+      ]);
       const picks = normalizeSleeperPicks(sleeperPicks);
       const lastPickNumber = getLastPickNumber(picks);
       const pickCount = picks.length;
@@ -311,11 +349,11 @@ export class DraftWatcher extends DurableObject<Env> {
       });
 
       if (changed) {
-        await this.deliverPickEvents(draftId, before, status, now.toISOString());
+        await this.deliverDraftHooks(draftId, sleeperDraft, before, status, now.toISOString());
       }
 
       if (status.isPolling && reschedule) {
-        await this.ctx.storage.setAlarm(Date.parse(status.nextPollAt ?? now.toISOString()));
+        await this.scheduleNextAlarm(status);
       }
 
       return status;
@@ -337,7 +375,7 @@ export class DraftWatcher extends DurableObject<Env> {
       this.appendEvent("poll.error", "Poll failed", { draftId, error: message });
 
       if (status.isPolling && reschedule) {
-        await this.ctx.storage.setAlarm(Date.parse(status.nextPollAt ?? now.toISOString()));
+        await this.scheduleNextAlarm(status);
       }
 
       return status;
@@ -379,82 +417,240 @@ export class DraftWatcher extends DurableObject<Env> {
     );
   }
 
-  private async deliverPickEvents(
+  private async deliverDraftHooks(
     draftId: string,
+    sleeperDraft: SleeperDraft,
     before: WatcherStatus,
     after: WatcherStatus,
     occurredAt: string,
   ): Promise<void> {
     const newPicks = after.picks.filter((pick) => {
       if (typeof pick.pickNo !== "number") return false;
+      if (typeof pick.playerId !== "string") return false;
+      if (typeof pick.rosterId !== "number") return false;
       return before.lastKnownPickNumber === null || pick.pickNo > before.lastKnownPickNumber;
     });
 
     for (const pick of newPicks) {
-      await this.deliverWebhook({
-        id: `draft:${draftId}:pick:${pick.pickNo}`,
-        type: "PickMade",
-        source: "draft-watcher",
+      await this.deliverOpenClawHook("draft-pick-announce", {
+        eventId: `draft:${draftId}:pick:${pick.pickNo}`,
+        eventType: "PickMade",
         draftId,
-        occurredAt,
-        statusUrl: this.buildStatusUrl(draftId),
-        pick,
+        pickNumber: pick.pickNo,
+        playerId: pick.playerId,
+        rosterId: pick.rosterId,
+        sourceVersion: "draft-watcher-v1",
+        observedAt: occurredAt,
+      });
+    }
+
+    await this.deliverCompletedRoundHooks(draftId, sleeperDraft, before.picks, after.picks, occurredAt);
+    await this.updateChandlerAutomation(draftId, sleeperDraft, after, occurredAt);
+  }
+
+  private async deliverCompletedRoundHooks(
+    draftId: string,
+    sleeperDraft: SleeperDraft,
+    beforePicks: DraftPick[],
+    afterPicks: DraftPick[],
+    completedAt: string,
+  ): Promise<void> {
+    const beforeRounds = completedRounds(sleeperDraft, beforePicks);
+    const afterRounds = completedRounds(sleeperDraft, afterPicks);
+
+    for (const round of afterRounds) {
+      if (beforeRounds.some((before) => before.round === round.round)) continue;
+
+      await this.deliverOpenClawHook("round-summary", {
+        eventId: `draft:${draftId}:round:${round.round}:completed`,
+        eventType: "RoundCompleted",
+        draftId,
+        round: round.round,
+        firstPickNumber: round.pickStart,
+        lastPickNumber: round.pickEnd,
+        completedAt,
+        sourceVersion: "draft-watcher-v1",
       });
     }
   }
 
-  private buildStatusUrl(draftId: string): string {
-    const env = this.env as RuntimeEnv;
-    const baseUrl = env.DRAFT_WATCHER_PUBLIC_BASE_URL?.replace(/\/+$/, "");
-    const path = `/api/drafts/${encodeURIComponent(draftId)}/status`;
-    return baseUrl ? `${baseUrl}${path}` : path;
-  }
+  private async updateChandlerAutomation(
+    draftId: string,
+    sleeperDraft: SleeperDraft,
+    status: WatcherStatus,
+    clockStartedAt: string,
+  ): Promise<void> {
+    const currentTurn = currentDraftTurn(sleeperDraft, status.picks);
+    const chandlerRosterId = parseOptionalInteger((this.env as RuntimeEnv).CHANDLER_ROSTER_ID);
+    const pending = await this.ctx.storage.get<PendingChandlerFallback>("pendingChandlerFallback");
 
-  private async deliverWebhook(event: DraftWebhookEvent): Promise<void> {
-    const env = this.env as RuntimeEnv;
-    const url = env.DRAFT_EVENT_WEBHOOK_URL?.trim();
-    if (!url) {
-      this.appendEvent("webhook.skipped", "No webhook URL configured", {
-        eventId: event.id,
-        eventType: event.type,
+    if (pending && status.lastKnownPickNumber !== null && status.lastKnownPickNumber >= pending.pickSequence) {
+      await this.ctx.storage.delete("pendingChandlerFallback");
+      this.appendEvent("chandler.fallback.cleared", "Chandler fallback cleared after pick", {
+        draftId,
+        pickSequence: pending.pickSequence,
       });
+    }
+
+    if (
+      chandlerRosterId === null ||
+      currentTurn.rosterId === null ||
+      currentTurn.rosterId !== chandlerRosterId
+    ) {
       return;
     }
 
-    const headers = new Headers({
-      "content-type": "application/json",
-      "user-agent": "draft-watcher/0.1",
-      "x-draft-watcher-event-id": event.id,
-      "x-draft-watcher-event-type": event.type,
+    const deadline = nextChandlerFallbackAt(new Date(clockStartedAt)).toISOString();
+    const pickSequence = currentTurn.pickNumber;
+    const rosterId = String(chandlerRosterId);
+
+    const adviceAccepted = await this.deliverOpenClawHook("chandler-pick", {
+      testMode: false,
+      eventId: `draft:${draftId}:pick:${pickSequence}:chandler-advice`,
+      eventType: "TurnStarted",
+      draftId,
+      pickSequence: String(pickSequence),
+      rosterId,
+      clockStartedAt,
+      deadline,
+      sourceVersion: "draft-watcher-v1",
+      strategyVersion: CHANDLER_STRATEGY_VERSION,
+      strategySnapshot: CHANDLER_ADVICE_STRATEGY,
     });
 
-    if (env.DRAFT_EVENT_WEBHOOK_TOKEN) {
-      headers.set("authorization", `Bearer ${env.DRAFT_EVENT_WEBHOOK_TOKEN}`);
+    if (!adviceAccepted) return;
+
+    const fallback: PendingChandlerFallback = {
+      draftId,
+      pickSequence,
+      rosterId,
+      clockStartedAt,
+      deadline,
+      thresholdReachedAt: deadline,
+      sourceVersion: "draft-watcher-v1",
+      strategyVersion: CHANDLER_STRATEGY_VERSION,
+      strategySnapshot: CHANDLER_FALLBACK_STRATEGY,
+    } as PendingChandlerFallback;
+    await this.ctx.storage.put("pendingChandlerFallback", fallback);
+    await this.scheduleNextAlarm(status);
+    this.appendEvent("chandler.fallback.scheduled", "Chandler fallback scheduled", {
+      draftId,
+      pickSequence,
+      thresholdReachedAt: deadline,
+    });
+  }
+
+  private async checkChandlerFallback(pending: PendingChandlerFallback): Promise<void> {
+    try {
+      const picks = normalizeSleeperPicks(await fetchSleeperPicks(pending.draftId));
+      const lastPickNumber = getLastPickNumber(picks);
+
+      if (lastPickNumber !== null && lastPickNumber >= pending.pickSequence) {
+        await this.ctx.storage.delete("pendingChandlerFallback");
+        this.appendEvent("chandler.fallback.skipped", "Chandler already picked", {
+          draftId: pending.draftId,
+          pickSequence: pending.pickSequence,
+          lastPickNumber,
+        });
+        return;
+      }
+
+      await this.deliverOpenClawHook("chandler-fallback", {
+        testMode: false,
+        eventId: `draft:${pending.draftId}:pick:${pending.pickSequence}:chandler-fallback`,
+        eventType: "FallbackDue",
+        draftId: pending.draftId,
+        pickSequence: String(pending.pickSequence),
+        rosterId: pending.rosterId,
+        clockStartedAt: pending.clockStartedAt,
+        deadline: pending.deadline,
+        thresholdReachedAt: new Date().toISOString(),
+        sourceVersion: "draft-watcher-v1",
+        strategyVersion: pending.strategyVersion,
+        strategySnapshot: pending.strategySnapshot,
+      });
+
+      await this.ctx.storage.delete("pendingChandlerFallback");
+    } catch (error) {
+      this.appendEvent("chandler.fallback.error", "Chandler fallback check failed", {
+        draftId: pending.draftId,
+        pickSequence: pending.pickSequence,
+        error: error instanceof Error ? error.message : "Unknown fallback error",
+      });
+    }
+  }
+
+  private async deliverOpenClawHook(
+    hook: ManualHookName,
+    payload: Record<string, unknown>,
+  ): Promise<boolean> {
+    const eventId = String(payload.eventId ?? "");
+    if (!eventId) throw new Error("OpenClaw hook payload is missing eventId");
+
+    if (this.hasDeliveredHook(eventId)) {
+      this.appendEvent("webhook.duplicate_skipped", "Webhook already delivered", {
+        eventId,
+        hook,
+      });
+      return true;
     }
 
     try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(event),
-        signal: AbortSignal.timeout(10_000),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Webhook returned ${response.status}`);
-      }
-
+      const result = await triggerOpenClawHook(this.env as RuntimeEnv, hook, payload);
+      this.markHookDelivered(eventId, hook, result.status);
       this.appendEvent("webhook.delivered", "Webhook delivered", {
-        eventId: event.id,
-        eventType: event.type,
-        status: response.status,
+        eventId,
+        hook,
+        status: result.status,
       });
+      return true;
     } catch (error) {
       this.appendEvent("webhook.error", "Webhook delivery failed", {
-        eventId: event.id,
-        eventType: event.type,
+        eventId,
+        hook,
         error: error instanceof Error ? error.message : "Unknown webhook error",
       });
+      return false;
+    }
+  }
+
+  private hasDeliveredHook(eventId: string): boolean {
+    return Boolean(
+      this.ctx.storage.sql
+        .exec("SELECT event_id FROM delivered_hooks WHERE event_id = ?", eventId)
+        .toArray()[0],
+    );
+  }
+
+  private markHookDelivered(eventId: string, hook: string, status: number): void {
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO delivered_hooks (event_id, hook, delivered_at, status)
+       VALUES (?, ?, ?, ?)`,
+      eventId,
+      hook,
+      new Date().toISOString(),
+      status,
+    );
+  }
+
+  private async scheduleNextAlarm(status: WatcherStatus): Promise<void> {
+    const times: number[] = [];
+    if (status.isPolling && status.nextPollAt) {
+      times.push(Date.parse(status.nextPollAt));
+    }
+
+    const pendingFallback = await this.ctx.storage.get<PendingChandlerFallback>(
+      "pendingChandlerFallback",
+    );
+    if (pendingFallback) {
+      times.push(Date.parse(pendingFallback.thresholdReachedAt));
+    }
+
+    const next = times.filter(Number.isFinite).sort((a, b) => a - b)[0];
+    if (next) {
+      await this.ctx.storage.setAlarm(next);
+    } else {
+      await this.ctx.storage.deleteAlarm();
     }
   }
 }
@@ -719,6 +915,10 @@ async function triggerOpenClawHook(
   path: ManualHookName,
   payload: Record<string, unknown>,
 ): Promise<{ status: number; eventId: string }> {
+  if (!env.WEBHOOK_TOKEN) {
+    throw new Error("WEBHOOK_TOKEN is not configured");
+  }
+
   const baseUrl = (env.OPENCLAW_BASE_URL ?? "https://ai-ff-commissioner.fly.dev").replace(/\/+$/, "");
   const response = await fetch(`${baseUrl}/hooks/${path}`, {
     method: "POST",
@@ -799,8 +999,15 @@ function latestCompletedRound(
   draft: SleeperDraft,
   picks: DraftPick[],
 ): { round: number; pickStart: number; pickEnd: number; pickCount: number } | null {
+  return completedRounds(draft, picks).sort((a, b) => b.round - a.round)[0] ?? null;
+}
+
+function completedRounds(
+  draft: SleeperDraft,
+  picks: DraftPick[],
+): Array<{ round: number; pickStart: number; pickEnd: number; pickCount: number }> {
   const teams = draftTeamCount(draft, picks);
-  if (!teams) return null;
+  if (!teams) return [];
 
   const rounds = new Map<number, DraftPick[]>();
   for (const pick of picks) {
@@ -830,7 +1037,7 @@ function latestCompletedRound(
       };
     })
     .filter((round): round is { round: number; pickStart: number; pickEnd: number; pickCount: number } => Boolean(round))
-    .sort((a, b) => b.round - a.round)[0] ?? null;
+    .sort((a, b) => a.round - b.round);
 }
 
 function currentDraftTurn(
@@ -849,6 +1056,24 @@ function currentDraftTurn(
   const draftSlot = isSnakeEvenRound ? teams - indexInRound : indexInRound + 1;
   const rosterId = numberFromRecord(draft.slot_to_roster_id, String(draftSlot));
   return { pickNumber, round, draftSlot, rosterId };
+}
+
+function nextChandlerFallbackAt(clockStartedAt: Date): Date {
+  const eatOffsetMs = 3 * 60 * 60 * 1000;
+  const eatNow = new Date(clockStartedAt.getTime() + eatOffsetMs);
+  const eatHour = eatNow.getUTCHours();
+
+  if (eatHour >= 12 && eatHour < 18) {
+    return new Date(clockStartedAt.getTime() + 6 * 60 * 60 * 1000);
+  }
+
+  const nextNoonEat = new Date(eatNow);
+  nextNoonEat.setUTCHours(12, 0, 0, 0);
+  if (eatNow.getTime() >= nextNoonEat.getTime()) {
+    nextNoonEat.setUTCDate(nextNoonEat.getUTCDate() + 1);
+  }
+
+  return new Date(nextNoonEat.getTime() - eatOffsetMs);
 }
 
 function draftTeamCount(draft: SleeperDraft, picks: DraftPick[]): number | null {
