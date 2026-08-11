@@ -58,6 +58,22 @@ type StartOptions = {
   pollIntervalSeconds?: number;
 };
 
+type RuntimeEnv = Env & {
+  DRAFT_EVENT_WEBHOOK_URL?: string;
+  DRAFT_EVENT_WEBHOOK_TOKEN?: string;
+  DRAFT_WATCHER_PUBLIC_BASE_URL?: string;
+};
+
+type DraftWebhookEvent = {
+  id: string;
+  type: "PickMade";
+  source: "draft-watcher";
+  draftId: string;
+  occurredAt: string;
+  statusUrl: string;
+  pick: DraftPick;
+};
+
 const DEFAULT_POLL_INTERVAL_SECONDS = 15;
 const MIN_POLL_INTERVAL_SECONDS = 10;
 const MAX_POLL_INTERVAL_SECONDS = 300;
@@ -273,6 +289,10 @@ export class DraftWatcher extends DurableObject<Env> {
         lastPickNumber,
       });
 
+      if (changed) {
+        await this.deliverPickEvents(draftId, before, status, now.toISOString());
+      }
+
       if (status.isPolling && reschedule) {
         await this.ctx.storage.setAlarm(Date.parse(status.nextPollAt ?? now.toISOString()));
       }
@@ -336,6 +356,85 @@ export class DraftWatcher extends DurableObject<Env> {
       message,
       JSON.stringify(details),
     );
+  }
+
+  private async deliverPickEvents(
+    draftId: string,
+    before: WatcherStatus,
+    after: WatcherStatus,
+    occurredAt: string,
+  ): Promise<void> {
+    const newPicks = after.picks.filter((pick) => {
+      if (typeof pick.pickNo !== "number") return false;
+      return before.lastKnownPickNumber === null || pick.pickNo > before.lastKnownPickNumber;
+    });
+
+    for (const pick of newPicks) {
+      await this.deliverWebhook({
+        id: `draft:${draftId}:pick:${pick.pickNo}`,
+        type: "PickMade",
+        source: "draft-watcher",
+        draftId,
+        occurredAt,
+        statusUrl: this.buildStatusUrl(draftId),
+        pick,
+      });
+    }
+  }
+
+  private buildStatusUrl(draftId: string): string {
+    const env = this.env as RuntimeEnv;
+    const baseUrl = env.DRAFT_WATCHER_PUBLIC_BASE_URL?.replace(/\/+$/, "");
+    const path = `/api/drafts/${encodeURIComponent(draftId)}/status`;
+    return baseUrl ? `${baseUrl}${path}` : path;
+  }
+
+  private async deliverWebhook(event: DraftWebhookEvent): Promise<void> {
+    const env = this.env as RuntimeEnv;
+    const url = env.DRAFT_EVENT_WEBHOOK_URL?.trim();
+    if (!url) {
+      this.appendEvent("webhook.skipped", "No webhook URL configured", {
+        eventId: event.id,
+        eventType: event.type,
+      });
+      return;
+    }
+
+    const headers = new Headers({
+      "content-type": "application/json",
+      "user-agent": "draft-watcher/0.1",
+      "x-draft-watcher-event-id": event.id,
+      "x-draft-watcher-event-type": event.type,
+    });
+
+    if (env.DRAFT_EVENT_WEBHOOK_TOKEN) {
+      headers.set("authorization", `Bearer ${env.DRAFT_EVENT_WEBHOOK_TOKEN}`);
+    }
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(event),
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Webhook returned ${response.status}`);
+      }
+
+      this.appendEvent("webhook.delivered", "Webhook delivered", {
+        eventId: event.id,
+        eventType: event.type,
+        status: response.status,
+      });
+    } catch (error) {
+      this.appendEvent("webhook.error", "Webhook delivery failed", {
+        eventId: event.id,
+        eventType: event.type,
+        error: error instanceof Error ? error.message : "Unknown webhook error",
+      });
+    }
   }
 }
 
