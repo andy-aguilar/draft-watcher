@@ -1307,9 +1307,10 @@ function renderDashboard(): string {
         font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
       main {
-        width: min(1120px, calc(100vw - 32px));
+        width: min(1480px, calc(100vw - 24px));
         margin: 0 auto;
-        padding: 28px 0 40px;
+        min-height: 100vh;
+        padding: 24px 0;
       }
       header {
         display: flex;
@@ -1402,6 +1403,8 @@ function renderDashboard(): string {
       .draft {
         display: grid;
         gap: 12px;
+        min-height: calc(100vh - 310px);
+        align-content: start;
       }
       .draft h2 {
         margin: 0;
@@ -1478,6 +1481,15 @@ function renderDashboard(): string {
       .tab-panel[hidden] {
         display: none;
       }
+      .tab-panel {
+        max-height: calc(100vh - 500px);
+        min-height: 280px;
+        overflow: auto;
+      }
+      div.tab-panel {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+      }
       table {
         width: 100%;
         border-collapse: collapse;
@@ -1499,6 +1511,8 @@ function renderDashboard(): string {
         .draft-meta { grid-template-columns: 1fr; }
         .toolbar { grid-template-columns: 1fr; }
         .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .draft { min-height: auto; }
+        .tab-panel { max-height: none; }
         table, thead, tbody, tr, th, td { display: block; }
         thead { display: none; }
         td { border-top: 0; padding: 4px 10px; }
