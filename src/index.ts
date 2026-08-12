@@ -95,7 +95,9 @@ type ManualHookName =
 
 type PendingChandlerFallback = {
   draftId: string;
-  pickSequence: number;
+  pickSequence: string | number;
+  turnStartPickNumber: number;
+  turnEndPickNumber: number;
   rosterId: string;
   clockStartedAt: string;
   deadline: string;
@@ -529,36 +531,58 @@ export class DraftWatcher extends DurableObject<Env> {
     status: WatcherStatus,
     clockStartedAt: string,
   ): Promise<void> {
-    const currentTurn = currentDraftTurn(sleeperDraft, status.picks);
     const chandlerRosterId = parseOptionalInteger((this.env as RuntimeEnv).CHANDLER_ROSTER_ID);
     const pending = await this.ctx.storage.get<PendingChandlerFallback>("pendingChandlerFallback");
+    const pendingTurnEndPickNumber = pending ? pendingFallbackTurnEndPickNumber(pending) : null;
 
-    if (pending && status.lastKnownPickNumber !== null && status.lastKnownPickNumber >= pending.pickSequence) {
+    if (
+      pending &&
+      pendingTurnEndPickNumber !== null &&
+      status.lastKnownPickNumber !== null &&
+      status.lastKnownPickNumber >= pendingTurnEndPickNumber
+    ) {
       await this.ctx.storage.delete("pendingChandlerFallback");
       this.appendEvent("chandler.fallback.cleared", "Chandler fallback cleared after pick", {
         draftId,
         pickSequence: pending.pickSequence,
+        turnEndPickNumber: pendingTurnEndPickNumber,
       });
     }
 
+    if (chandlerRosterId === null) {
+      return;
+    }
+
+    const currentTurn = chandlerDraftTurn(sleeperDraft, status.picks, chandlerRosterId);
+    if (!currentTurn) return;
+
+    const pickSequence = chandlerTurnPickSequence(currentTurn);
+    const adviceEventId = `draft:${draftId}:turn:${pickSequence}:chandler-advice`;
+    const fallbackEventId = `draft:${draftId}:turn:${pickSequence}:chandler-fallback`;
+
     if (
-      chandlerRosterId === null ||
-      currentTurn.rosterId === null ||
-      currentTurn.rosterId !== chandlerRosterId
+      pending &&
+      pending.draftId === draftId &&
+      pending.pickSequence === pickSequence &&
+      pending.rosterId === String(chandlerRosterId)
     ) {
       return;
     }
 
+    if (this.hasDeliveredHook(fallbackEventId)) return;
+
     const deadline = nextChandlerFallbackAt(new Date(clockStartedAt)).toISOString();
-    const pickSequence = currentTurn.pickNumber;
     const rosterId = String(chandlerRosterId);
 
     const adviceAccepted = await this.deliverOpenClawHook("chandler-pick", {
       testMode: false,
-      eventId: `draft:${draftId}:pick:${pickSequence}:chandler-advice`,
+      eventId: adviceEventId,
       eventType: "TurnStarted",
       draftId,
-      pickSequence: String(pickSequence),
+      pickSequence,
+      turnStartPickNumber: currentTurn.startPickNumber,
+      turnEndPickNumber: currentTurn.endPickNumber,
+      turnPickNumbers: currentTurn.pickNumbers,
       rosterId,
       clockStartedAt,
       deadline,
@@ -572,6 +596,8 @@ export class DraftWatcher extends DurableObject<Env> {
     const fallback: PendingChandlerFallback = {
       draftId,
       pickSequence,
+      turnStartPickNumber: currentTurn.startPickNumber,
+      turnEndPickNumber: currentTurn.endPickNumber,
       rosterId,
       clockStartedAt,
       deadline,
@@ -585,6 +611,8 @@ export class DraftWatcher extends DurableObject<Env> {
     this.appendEvent("chandler.fallback.scheduled", "Chandler fallback scheduled", {
       draftId,
       pickSequence,
+      turnStartPickNumber: currentTurn.startPickNumber,
+      turnEndPickNumber: currentTurn.endPickNumber,
       thresholdReachedAt: deadline,
     });
   }
@@ -593,12 +621,19 @@ export class DraftWatcher extends DurableObject<Env> {
     try {
       const picks = normalizeSleeperPicks(await fetchSleeperPicks(pending.draftId));
       const lastPickNumber = getLastPickNumber(picks);
+      const turnStartPickNumber = pendingFallbackTurnStartPickNumber(pending);
+      const turnEndPickNumber = pendingFallbackTurnEndPickNumber(pending);
 
-      if (lastPickNumber !== null && lastPickNumber >= pending.pickSequence) {
+      if (
+        turnEndPickNumber !== null &&
+        lastPickNumber !== null &&
+        lastPickNumber >= turnEndPickNumber
+      ) {
         await this.ctx.storage.delete("pendingChandlerFallback");
         this.appendEvent("chandler.fallback.skipped", "Chandler already picked", {
           draftId: pending.draftId,
           pickSequence: pending.pickSequence,
+          turnEndPickNumber,
           lastPickNumber,
         });
         return;
@@ -606,10 +641,16 @@ export class DraftWatcher extends DurableObject<Env> {
 
       await this.deliverOpenClawHook("chandler-fallback", {
         testMode: false,
-        eventId: `draft:${pending.draftId}:pick:${pending.pickSequence}:chandler-fallback`,
+        eventId: `draft:${pending.draftId}:turn:${pending.pickSequence}:chandler-fallback`,
         eventType: "FallbackDue",
         draftId: pending.draftId,
-        pickSequence: String(pending.pickSequence),
+        pickSequence: pending.pickSequence,
+        turnStartPickNumber,
+        turnEndPickNumber,
+        turnPickNumbers:
+          turnStartPickNumber !== null && turnEndPickNumber !== null
+            ? pickNumbersBetween(turnStartPickNumber, turnEndPickNumber)
+            : [],
         rosterId: pending.rosterId,
         clockStartedAt: pending.clockStartedAt,
         deadline: pending.deadline,
@@ -950,6 +991,16 @@ function buildManualHookPayload({
   const currentTurn = currentDraftTurn(sleeperDraft, picks);
   const chandlerRosterId = parseOptionalInteger(env.CHANDLER_ROSTER_ID);
   const rosterId = chandlerRosterId ?? currentTurn.rosterId;
+  const chandlerTurn =
+    rosterId === null ? null : chandlerDraftTurn(sleeperDraft, picks, rosterId);
+  const turnStartPickNumber = chandlerTurn?.startPickNumber ?? currentTurn.pickNumber;
+  const turnEndPickNumber = chandlerTurn?.endPickNumber ?? currentTurn.pickNumber;
+  const turnPickNumbers =
+    chandlerTurn?.pickNumbers ?? pickNumbersBetween(turnStartPickNumber, turnEndPickNumber);
+  const pickSequence =
+    turnStartPickNumber === turnEndPickNumber
+      ? String(turnStartPickNumber)
+      : `${turnStartPickNumber}-${turnEndPickNumber}`;
   const clockStartedAt = observedAt;
   const deadline = new Date(Date.parse(observedAt) + 20 * 60 * 60 * 1000).toISOString();
 
@@ -963,7 +1014,10 @@ function buildManualHookPayload({
       eventId: `manual-test:chandler-advice:${crypto.randomUUID()}`,
       eventType: "TurnStarted",
       draftId,
-      pickSequence: String(currentTurn.pickNumber),
+      pickSequence,
+      turnStartPickNumber,
+      turnEndPickNumber,
+      turnPickNumbers,
       rosterId: String(rosterId),
       clockStartedAt,
       deadline,
@@ -979,7 +1033,10 @@ function buildManualHookPayload({
     eventId: `manual-test:chandler-fallback:${crypto.randomUUID()}`,
     eventType: "FallbackDue",
     draftId,
-    pickSequence: String(currentTurn.pickNumber),
+    pickSequence,
+    turnStartPickNumber,
+    turnEndPickNumber,
+    turnPickNumbers,
     rosterId: String(rosterId),
     clockStartedAt,
     deadline,
@@ -1125,8 +1182,15 @@ function currentDraftTurn(
   draft: SleeperDraft,
   picks: DraftPick[],
 ): { pickNumber: number; round: number | null; draftSlot: number | null; rosterId: number | null } {
+  return draftTurnAtPick(draft, picks.length + 1, picks);
+}
+
+function draftTurnAtPick(
+  draft: SleeperDraft,
+  pickNumber: number,
+  picks: DraftPick[],
+): { pickNumber: number; round: number | null; draftSlot: number | null; rosterId: number | null } {
   const teams = draftTeamCount(draft, picks);
-  const pickNumber = picks.length + 1;
   if (!teams) {
     return { pickNumber, round: null, draftSlot: null, rosterId: null };
   }
@@ -1137,6 +1201,84 @@ function currentDraftTurn(
   const draftSlot = isSnakeEvenRound ? teams - indexInRound : indexInRound + 1;
   const rosterId = numberFromRecord(draft.slot_to_roster_id, String(draftSlot));
   return { pickNumber, round, draftSlot, rosterId };
+}
+
+function chandlerDraftTurn(
+  draft: SleeperDraft,
+  picks: DraftPick[],
+  chandlerRosterId: number,
+): { startPickNumber: number; endPickNumber: number; pickNumbers: number[] } | null {
+  const currentPickNumber = picks.length + 1;
+  const currentTurn = draftTurnAtPick(draft, currentPickNumber, picks);
+  if (currentTurn.rosterId !== chandlerRosterId) return null;
+
+  let startPickNumber = currentPickNumber;
+  let endPickNumber = currentPickNumber;
+  const totalPicks = totalDraftPicks(draft, picks);
+
+  while (
+    startPickNumber > 1 &&
+    draftTurnAtPick(draft, startPickNumber - 1, picks).rosterId === chandlerRosterId
+  ) {
+    startPickNumber -= 1;
+  }
+
+  while (
+    endPickNumber < totalPicks &&
+    draftTurnAtPick(draft, endPickNumber + 1, picks).rosterId === chandlerRosterId
+  ) {
+    endPickNumber += 1;
+  }
+
+  return {
+    startPickNumber,
+    endPickNumber,
+    pickNumbers: pickNumbersBetween(startPickNumber, endPickNumber),
+  };
+}
+
+function chandlerTurnPickSequence(turn: { startPickNumber: number; endPickNumber: number }): string {
+  if (turn.startPickNumber === turn.endPickNumber) return String(turn.startPickNumber);
+  return `${turn.startPickNumber}-${turn.endPickNumber}`;
+}
+
+function pickNumbersBetween(startPickNumber: number, endPickNumber: number): number[] {
+  const picks: number[] = [];
+  for (let pickNumber = startPickNumber; pickNumber <= endPickNumber; pickNumber += 1) {
+    picks.push(pickNumber);
+  }
+  return picks;
+}
+
+function pendingFallbackTurnEndPickNumber(pending: PendingChandlerFallback): number | null {
+  if (typeof pending.turnEndPickNumber === "number" && Number.isFinite(pending.turnEndPickNumber)) {
+    return pending.turnEndPickNumber;
+  }
+
+  if (typeof pending.pickSequence === "number" && Number.isFinite(pending.pickSequence)) {
+    return pending.pickSequence;
+  }
+
+  const sequence = String(pending.pickSequence);
+  const match = /(\d+)$/.exec(sequence);
+  return match ? Number(match[1]) : null;
+}
+
+function pendingFallbackTurnStartPickNumber(pending: PendingChandlerFallback): number | null {
+  if (
+    typeof pending.turnStartPickNumber === "number" &&
+    Number.isFinite(pending.turnStartPickNumber)
+  ) {
+    return pending.turnStartPickNumber;
+  }
+
+  if (typeof pending.pickSequence === "number" && Number.isFinite(pending.pickSequence)) {
+    return pending.pickSequence;
+  }
+
+  const sequence = String(pending.pickSequence);
+  const match = /^(\d+)/.exec(sequence);
+  return match ? Number(match[1]) : null;
 }
 
 function nextChandlerFallbackAt(clockStartedAt: Date): Date {
@@ -1172,6 +1314,15 @@ function draftTeamCount(draft: SleeperDraft, picks: DraftPick[]): number | null 
       .filter((draftSlot): draftSlot is number => typeof draftSlot === "number"),
   );
   return maxSlot > 0 ? maxSlot : null;
+}
+
+function totalDraftPicks(draft: SleeperDraft, picks: DraftPick[]): number {
+  const teams = draftTeamCount(draft, picks);
+  if (teams && typeof draft.settings?.rounds === "number" && draft.settings.rounds > 0) {
+    return teams * draft.settings.rounds;
+  }
+
+  return Math.max(picks.length + (teams ?? 1), picks.length + 1);
 }
 
 function numberFromRecord(record: Record<string, number> | undefined, key: string): number | null {

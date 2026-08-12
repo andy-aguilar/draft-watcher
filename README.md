@@ -38,8 +38,8 @@ Automatic hooks:
 
 - New completed pick: `POST /hooks/draft-pick-announce`
 - Newly completed round: `POST /hooks/round-summary`
-- Chandler on the clock: `POST /hooks/chandler-pick`
-- Chandler fallback check due and pick still unmade: `POST /hooks/chandler-fallback`
+- Chandler on the clock for a turn: `POST /hooks/chandler-pick`
+- Chandler fallback check due and the turn still has an unmade pick: `POST /hooks/chandler-fallback`
 
 Pick announcement payload:
 
@@ -61,10 +61,18 @@ the manual test buttons below, with stable `draft:<...>` event IDs and
 `sourceVersion: draft-watcher-v1`. Successfully accepted event IDs are stored in
 the draft Durable Object so repeated polls do not double-post the same hook.
 
+The Chandler advice and fallback hooks are keyed by the whole turn, not by a
+single pick. At a snake turn, a payload can use a range such as
+`pickSequence: "12-13"` and includes `turnStartPickNumber`,
+`turnEndPickNumber`, and `turnPickNumbers`. That keeps advice/fallback from
+double-firing when Chandler has consecutive picks at the end or beginning of a
+round.
+
 The Chandler fallback timer uses East Africa Time, UTC+3. If Chandler comes on
 clock from noon through 17:59 EAT, the fallback check is scheduled six hours
 later; otherwise it waits until the next noon EAT. The fallback alarm re-checks
-Sleeper before calling SCBot and skips the hook if Chandler has already picked.
+Sleeper before calling SCBot and skips the hook if Chandler's full turn has
+already been picked.
 
 ## Manual SCBot Hook Tests
 
@@ -124,7 +132,10 @@ The Chandler advice test sends:
   "eventId": "manual-test:chandler-advice:<uuid>",
   "eventType": "TurnStarted",
   "draftId": "<draft_id>",
-  "pickSequence": "<current_pick_number>",
+  "pickSequence": "<turn_pick_number_or_range>",
+  "turnStartPickNumber": 12,
+  "turnEndPickNumber": 13,
+  "turnPickNumbers": [12, 13],
   "rosterId": "7",
   "clockStartedAt": "2026-08-11T19:30:00.000Z",
   "deadline": "2026-08-12T15:30:00.000Z",
@@ -142,7 +153,10 @@ The Chandler fallback test sends:
   "eventId": "manual-test:chandler-fallback:<uuid>",
   "eventType": "FallbackDue",
   "draftId": "<draft_id>",
-  "pickSequence": "<current_pick_number>",
+  "pickSequence": "<turn_pick_number_or_range>",
+  "turnStartPickNumber": 12,
+  "turnEndPickNumber": 13,
+  "turnPickNumbers": [12, 13],
   "rosterId": "7",
   "clockStartedAt": "2026-08-11T19:30:00.000Z",
   "deadline": "2026-08-12T15:30:00.000Z",
