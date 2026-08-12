@@ -62,11 +62,12 @@ the manual test buttons below, with stable `draft:<...>` event IDs and
 the draft Durable Object so repeated polls do not double-post the same hook.
 
 The Chandler advice and fallback hooks are keyed by the whole turn, not by a
-single pick. At a snake turn, a payload can use a range such as
-`pickSequence: "12-13"` and includes `turnStartPickNumber`,
+single pick. `pickSequence` remains a single pick number string for compatibility,
+using the first pick in the turn. At a snake turn, event IDs and payloads include
+a range key such as `turnKey: "12-13"` plus `turnStartPickNumber`,
 `turnEndPickNumber`, and `turnPickNumbers`. That keeps advice/fallback from
 double-firing when Chandler has consecutive picks at the end or beginning of a
-round.
+round without breaking existing hook consumers.
 
 The Chandler fallback timer uses East Africa Time, UTC+3. If Chandler comes on
 clock from noon through 17:59 EAT, the fallback check is scheduled six hours
@@ -132,7 +133,8 @@ The Chandler advice test sends:
   "eventId": "manual-test:chandler-advice:<uuid>",
   "eventType": "TurnStarted",
   "draftId": "<draft_id>",
-  "pickSequence": "<turn_pick_number_or_range>",
+  "pickSequence": "<first_pick_number_in_turn>",
+  "turnKey": "12-13",
   "turnStartPickNumber": 12,
   "turnEndPickNumber": 13,
   "turnPickNumbers": [12, 13],
@@ -153,7 +155,8 @@ The Chandler fallback test sends:
   "eventId": "manual-test:chandler-fallback:<uuid>",
   "eventType": "FallbackDue",
   "draftId": "<draft_id>",
-  "pickSequence": "<turn_pick_number_or_range>",
+  "pickSequence": "<first_pick_number_in_turn>",
+  "turnKey": "12-13",
   "turnStartPickNumber": 12,
   "turnEndPickNumber": 13,
   "turnPickNumbers": [12, 13],

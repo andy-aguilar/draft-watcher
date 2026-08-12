@@ -95,7 +95,8 @@ type ManualHookName =
 
 type PendingChandlerFallback = {
   draftId: string;
-  pickSequence: string | number;
+  pickSequence: number;
+  turnKey: string;
   turnStartPickNumber: number;
   turnEndPickNumber: number;
   rosterId: string;
@@ -556,14 +557,15 @@ export class DraftWatcher extends DurableObject<Env> {
     const currentTurn = chandlerDraftTurn(sleeperDraft, status.picks, chandlerRosterId);
     if (!currentTurn) return;
 
-    const pickSequence = chandlerTurnPickSequence(currentTurn);
-    const adviceEventId = `draft:${draftId}:turn:${pickSequence}:chandler-advice`;
-    const fallbackEventId = `draft:${draftId}:turn:${pickSequence}:chandler-fallback`;
+    const pickSequence = currentTurn.startPickNumber;
+    const turnKey = chandlerTurnPickSequence(currentTurn);
+    const adviceEventId = `draft:${draftId}:turn:${turnKey}:chandler-advice`;
+    const fallbackEventId = `draft:${draftId}:turn:${turnKey}:chandler-fallback`;
 
     if (
       pending &&
       pending.draftId === draftId &&
-      pending.pickSequence === pickSequence &&
+      pendingFallbackTurnKey(pending) === turnKey &&
       pending.rosterId === String(chandlerRosterId)
     ) {
       return;
@@ -579,7 +581,8 @@ export class DraftWatcher extends DurableObject<Env> {
       eventId: adviceEventId,
       eventType: "TurnStarted",
       draftId,
-      pickSequence,
+      pickSequence: String(pickSequence),
+      turnKey,
       turnStartPickNumber: currentTurn.startPickNumber,
       turnEndPickNumber: currentTurn.endPickNumber,
       turnPickNumbers: currentTurn.pickNumbers,
@@ -596,6 +599,7 @@ export class DraftWatcher extends DurableObject<Env> {
     const fallback: PendingChandlerFallback = {
       draftId,
       pickSequence,
+      turnKey,
       turnStartPickNumber: currentTurn.startPickNumber,
       turnEndPickNumber: currentTurn.endPickNumber,
       rosterId,
@@ -611,6 +615,7 @@ export class DraftWatcher extends DurableObject<Env> {
     this.appendEvent("chandler.fallback.scheduled", "Chandler fallback scheduled", {
       draftId,
       pickSequence,
+      turnKey,
       turnStartPickNumber: currentTurn.startPickNumber,
       turnEndPickNumber: currentTurn.endPickNumber,
       thresholdReachedAt: deadline,
@@ -641,10 +646,11 @@ export class DraftWatcher extends DurableObject<Env> {
 
       await this.deliverOpenClawHook("chandler-fallback", {
         testMode: false,
-        eventId: `draft:${pending.draftId}:turn:${pending.pickSequence}:chandler-fallback`,
+        eventId: `draft:${pending.draftId}:turn:${pendingFallbackTurnKey(pending)}:chandler-fallback`,
         eventType: "FallbackDue",
         draftId: pending.draftId,
-        pickSequence: pending.pickSequence,
+        pickSequence: String(pending.pickSequence),
+        turnKey: pendingFallbackTurnKey(pending),
         turnStartPickNumber,
         turnEndPickNumber,
         turnPickNumbers:
@@ -997,7 +1003,8 @@ function buildManualHookPayload({
   const turnEndPickNumber = chandlerTurn?.endPickNumber ?? currentTurn.pickNumber;
   const turnPickNumbers =
     chandlerTurn?.pickNumbers ?? pickNumbersBetween(turnStartPickNumber, turnEndPickNumber);
-  const pickSequence =
+  const pickSequence = String(turnStartPickNumber);
+  const turnKey =
     turnStartPickNumber === turnEndPickNumber
       ? String(turnStartPickNumber)
       : `${turnStartPickNumber}-${turnEndPickNumber}`;
@@ -1015,6 +1022,7 @@ function buildManualHookPayload({
       eventType: "TurnStarted",
       draftId,
       pickSequence,
+      turnKey,
       turnStartPickNumber,
       turnEndPickNumber,
       turnPickNumbers,
@@ -1034,6 +1042,7 @@ function buildManualHookPayload({
     eventType: "FallbackDue",
     draftId,
     pickSequence,
+    turnKey,
     turnStartPickNumber,
     turnEndPickNumber,
     turnPickNumbers,
@@ -1262,6 +1271,24 @@ function pendingFallbackTurnEndPickNumber(pending: PendingChandlerFallback): num
   const sequence = String(pending.pickSequence);
   const match = /(\d+)$/.exec(sequence);
   return match ? Number(match[1]) : null;
+}
+
+function pendingFallbackTurnKey(pending: PendingChandlerFallback): string {
+  if (typeof pending.turnKey === "string" && pending.turnKey.trim()) {
+    return pending.turnKey.trim();
+  }
+
+  const turnStartPickNumber = pendingFallbackTurnStartPickNumber(pending);
+  const turnEndPickNumber = pendingFallbackTurnEndPickNumber(pending);
+  if (
+    turnStartPickNumber !== null &&
+    turnEndPickNumber !== null &&
+    turnStartPickNumber !== turnEndPickNumber
+  ) {
+    return `${turnStartPickNumber}-${turnEndPickNumber}`;
+  }
+
+  return String(pending.pickSequence);
 }
 
 function pendingFallbackTurnStartPickNumber(pending: PendingChandlerFallback): number | null {
